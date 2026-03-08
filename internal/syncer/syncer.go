@@ -22,6 +22,12 @@ type Syncer struct {
 	orgID int64
 }
 
+const (
+	privateStreamID   int64 = 0
+	privateStreamName       = "direct-messages"
+	privateTopicName        = "direct messages"
+)
+
 type Options struct {
 	Full    bool
 	Streams []string
@@ -109,6 +115,11 @@ func (s *Syncer) Sync(ctx context.Context, opts Options) error {
 			return err
 		}
 	}
+
+	if err := s.syncPrivateMessages(ctx, opts); err != nil {
+		return fmt.Errorf("private messages: %w", err)
+	}
+
 	return nil
 }
 
@@ -228,6 +239,123 @@ func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) 
 	}
 	if maxID > 0 {
 		if err := s.store.UpdateSyncState(ctx, s.orgID, st.StreamID, maxID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Syncer) syncPrivateMessages(ctx context.Context, opts Options) error {
+	if err := s.store.UpsertStream(ctx, store.Stream{
+		ID:          privateStreamID,
+		OrgID:       s.orgID,
+		Name:        privateStreamName,
+		Description: "direct/private Zulip messages",
+		InviteOnly:  true,
+		IsWebPublic: false,
+	}); err != nil {
+		return err
+	}
+
+	anchor := "oldest"
+	if !opts.Full {
+		if last, err := s.store.LastMessageID(ctx, s.orgID, privateStreamID); err == nil && last > 0 {
+			anchor = fmt.Sprintf("%d", last)
+		}
+	}
+
+	touched := map[int64]struct{}{}
+	var maxID int64
+	for {
+		resp, err := s.api.Messages(ctx, zulip.MessagesRequest{
+			Anchor:    anchor,
+			NumBefore: 0,
+			NumAfter:  1000,
+			Narrow: []map[string]any{{
+				"operator": "is",
+				"operand":  "private",
+			}},
+			ApplyMarkdown: true,
+		})
+		if err != nil {
+			return err
+		}
+		if len(resp.Messages) == 0 {
+			break
+		}
+
+		for _, m := range resp.Messages {
+			if err := s.store.UpsertUser(ctx, store.User{
+				ID:       m.SenderID,
+				OrgID:    s.orgID,
+				FullName: m.SenderFullName,
+			}); err != nil {
+				return fmt.Errorf("auto-upsert sender %d (%s): %w", m.SenderID, m.SenderFullName, err)
+			}
+		}
+
+		batch := make([]store.Message, 0, len(resp.Messages))
+		for _, m := range resp.Messages {
+			ts := time.Unix(m.Timestamp, 0).UTC().Format(time.RFC3339)
+			if opts.Since != "" && ts < opts.Since {
+				continue
+			}
+			topicID, err := s.store.GetOrCreateTopic(ctx, s.orgID, privateStreamID, privateTopicName)
+			if err != nil {
+				return fmt.Errorf("get/create private topic: %w", err)
+			}
+			touched[topicID] = struct{}{}
+
+			editTS := ""
+			if m.EditTimestamp > 0 {
+				editTS = time.Unix(m.EditTimestamp, 0).UTC().Format(time.RFC3339)
+			}
+			contentText := htmlToText(m.Content)
+			hasLink := strings.Contains(strings.ToLower(m.Content), "href=") ||
+				strings.Contains(contentText, "http://") ||
+				strings.Contains(contentText, "https://")
+			hasImage := strings.Contains(strings.ToLower(m.Content), "<img")
+			hasAttachment := strings.Contains(strings.ToLower(m.Content), "class=\"message_inline_ref\"")
+
+			batch = append(batch, store.Message{
+				ID:            m.ID,
+				OrgID:         s.orgID,
+				StreamID:      privateStreamID,
+				TopicID:       topicID,
+				SenderID:      m.SenderID,
+				Content:       m.Content,
+				ContentText:   contentText,
+				Timestamp:     ts,
+				EditTimestamp: editTS,
+				HasAttachment: hasAttachment,
+				HasImage:      hasImage,
+				HasLink:       hasLink,
+				Reactions:     json.RawMessage(m.Reactions),
+				IsMeMessage:   m.IsMe,
+			})
+			if m.ID > maxID {
+				maxID = m.ID
+			}
+		}
+
+		if err := s.store.UpsertMessageBatch(ctx, batch); err != nil {
+			return fmt.Errorf("batch upsert (%d msgs): %w", len(batch), err)
+		}
+
+		lastID := resp.Messages[len(resp.Messages)-1].ID
+		anchor = fmt.Sprintf("%d", lastID+1)
+		if resp.FoundNewest {
+			break
+		}
+	}
+
+	for tid := range touched {
+		if err := s.store.RecomputeTopicStats(ctx, tid); err != nil {
+			return err
+		}
+	}
+	if maxID > 0 {
+		if err := s.store.UpdateSyncState(ctx, s.orgID, privateStreamID, maxID); err != nil {
 			return err
 		}
 	}
