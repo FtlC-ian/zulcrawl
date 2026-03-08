@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/debbie/zulcrawl/internal/cli"
+	"github.com/FtlC-ian/zulcrawl/internal/cli"
 )
 
 func main() {

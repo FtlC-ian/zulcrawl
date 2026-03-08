@@ -11,11 +11,11 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/debbie/zulcrawl/internal/config"
-	"github.com/debbie/zulcrawl/internal/search"
-	"github.com/debbie/zulcrawl/internal/store"
-	"github.com/debbie/zulcrawl/internal/syncer"
-	"github.com/debbie/zulcrawl/internal/zulip"
+	"github.com/FtlC-ian/zulcrawl/internal/config"
+	"github.com/FtlC-ian/zulcrawl/internal/search"
+	"github.com/FtlC-ian/zulcrawl/internal/store"
+	"github.com/FtlC-ian/zulcrawl/internal/syncer"
+	"github.com/FtlC-ian/zulcrawl/internal/zulip"
 )
 
 func NewRootCmd() *cobra.Command {

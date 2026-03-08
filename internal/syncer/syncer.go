@@ -10,9 +10,9 @@ import (
 
 	"golang.org/x/net/html"
 
-	"github.com/debbie/zulcrawl/internal/config"
-	"github.com/debbie/zulcrawl/internal/store"
-	"github.com/debbie/zulcrawl/internal/zulip"
+	"github.com/FtlC-ian/zulcrawl/internal/config"
+	"github.com/FtlC-ian/zulcrawl/internal/store"
+	"github.com/FtlC-ian/zulcrawl/internal/zulip"
 )
 
 type Syncer struct {

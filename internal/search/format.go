@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/debbie/zulcrawl/internal/store"
+	"github.com/FtlC-ian/zulcrawl/internal/store"
 )
 
 func FormatHits(hits []store.SearchHit) string {

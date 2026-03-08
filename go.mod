@@ -1,4 +1,4 @@
-module github.com/debbie/zulcrawl
+module github.com/FtlC-ian/zulcrawl
 
 go 1.23
 
