@@ -143,6 +143,19 @@ func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) 
 		}
 
 		// Build the batch for this page.
+		// Auto-upsert senders from message metadata. The /users endpoint may
+		// not return bots, system users, or deactivated accounts, but every
+		// message carries sender_id + sender_full_name, so we can ensure the
+		// FK target exists before inserting the message.
+		for _, m := range resp.Messages {
+			if err := s.store.UpsertUser(ctx, store.User{
+				ID:       m.SenderID,
+				OrgID:    s.orgID,
+				FullName: m.SenderFullName,
+			}); err != nil {
+				return fmt.Errorf("auto-upsert sender %d (%s): %w", m.SenderID, m.SenderFullName, err)
+			}
+		}
 		batch := make([]store.Message, 0, len(resp.Messages))
 		for _, m := range resp.Messages {
 			topic := m.Topic
@@ -155,7 +168,7 @@ func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) 
 			}
 			topicID, err := s.store.GetOrCreateTopic(ctx, s.orgID, st.StreamID, topic)
 			if err != nil {
-				return err
+				return fmt.Errorf("get/create topic %q in stream %d: %w", topic, st.StreamID, err)
 			}
 			touched[topicID] = struct{}{}
 			editTS := ""
@@ -195,7 +208,7 @@ func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) 
 
 		// Wrap the entire page in one transaction for throughput.
 		if err := s.store.UpsertMessageBatch(ctx, batch); err != nil {
-			return err
+			return fmt.Errorf("batch upsert (%d msgs): %w", len(batch), err)
 		}
 
 		// Advance anchor past the last seen ID to avoid re-fetching it on the

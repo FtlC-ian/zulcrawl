@@ -346,20 +346,41 @@ func applyOpenClawConfig(path string, cfg *config.Config) error {
 	if err := json.Unmarshal(b, &m); err != nil {
 		return err
 	}
-	// Best effort: support common key names.
+	// Look specifically at channels.zulip in OpenClaw config structure.
+	zulipCfg := nestedMap(m, "channels", "zulip")
+	if zulipCfg == nil {
+		// Fallback: try flat keys (non-OpenClaw config files).
+		zulipCfg = m
+	}
 	if cfg.Zulip.URL == "" {
-		cfg.Zulip.URL = firstString(m, "zulip_url", "zulipUrl", "url")
+		cfg.Zulip.URL = flatString(zulipCfg, "url")
 	}
 	if cfg.Zulip.Email == "" {
-		cfg.Zulip.Email = firstString(m, "zulip_email", "zulipEmail", "email")
+		cfg.Zulip.Email = flatString(zulipCfg, "email")
 	}
 	if cfg.Zulip.APIKey == "" {
-		cfg.Zulip.APIKey = firstString(m, "zulip_api_key", "zulipApiKey", "api_key", "apiKey")
+		cfg.Zulip.APIKey = flatString(zulipCfg, "apiKey", "api_key")
 	}
 	return nil
 }
 
-func firstString(m map[string]any, keys ...string) string {
+func nestedMap(m map[string]any, keys ...string) map[string]any {
+	cur := m
+	for _, k := range keys {
+		v, ok := cur[k]
+		if !ok {
+			return nil
+		}
+		sub, ok := v.(map[string]any)
+		if !ok {
+			return nil
+		}
+		cur = sub
+	}
+	return cur
+}
+
+func flatString(m map[string]any, keys ...string) string {
 	for _, k := range keys {
 		if v, ok := m[k]; ok {
 			if s, ok := v.(string); ok {
@@ -367,14 +388,7 @@ func firstString(m map[string]any, keys ...string) string {
 			}
 		}
 	}
-	for _, v := range m {
-		sub, ok := v.(map[string]any)
-		if !ok {
-			continue
-		}
-		if s := firstString(sub, keys...); s != "" {
-			return s
-		}
-	}
 	return ""
 }
+
+

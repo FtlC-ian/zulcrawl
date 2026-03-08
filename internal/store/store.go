@@ -126,16 +126,10 @@ CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
     COALESCE((SELECT full_name FROM users WHERE id = new.sender_id),''));
 END;
 CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, content_text, topic_name, sender_name)
-  VALUES('delete', old.id, old.content_text,
-    COALESCE((SELECT name FROM topics WHERE id = old.topic_id),''),
-    COALESCE((SELECT full_name FROM users WHERE id = old.sender_id),''));
+  DELETE FROM messages_fts WHERE rowid = old.id;
 END;
 CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-  INSERT INTO messages_fts(messages_fts, rowid, content_text, topic_name, sender_name)
-  VALUES('delete', old.id, old.content_text,
-    COALESCE((SELECT name FROM topics WHERE id = old.topic_id),''),
-    COALESCE((SELECT full_name FROM users WHERE id = old.sender_id),''));
+  DELETE FROM messages_fts WHERE rowid = old.id;
   INSERT INTO messages_fts(rowid, content_text, topic_name, sender_name)
   VALUES (new.id, new.content_text,
     COALESCE((SELECT name FROM topics WHERE id = new.topic_id),''),
@@ -146,10 +140,10 @@ CREATE TRIGGER IF NOT EXISTS topics_ai AFTER INSERT ON topics BEGIN
   INSERT INTO topics_fts(rowid, name) VALUES(new.id, new.name);
 END;
 CREATE TRIGGER IF NOT EXISTS topics_ad AFTER DELETE ON topics BEGIN
-  INSERT INTO topics_fts(topics_fts, rowid, name) VALUES('delete', old.id, old.name);
+  DELETE FROM topics_fts WHERE rowid = old.id;
 END;
 CREATE TRIGGER IF NOT EXISTS topics_au AFTER UPDATE ON topics BEGIN
-  INSERT INTO topics_fts(topics_fts, rowid, name) VALUES('delete', old.id, old.name);
+  DELETE FROM topics_fts WHERE rowid = old.id;
   INSERT INTO topics_fts(rowid, name) VALUES(new.id, new.name);
 END;
 `
@@ -262,6 +256,10 @@ type execer interface {
 }
 
 func (s *Store) upsertMessageTx(ctx context.Context, ex execer, m Message) error {
+	reactions := string(m.Reactions)
+	if reactions == "" {
+		reactions = "[]"
+	}
 	_, err := ex.ExecContext(ctx, `
 INSERT INTO messages(
 id, org_id, stream_id, topic_id, sender_id, content, content_text, timestamp, edit_timestamp,
@@ -283,7 +281,7 @@ is_me_message=excluded.is_me_message
 `,
 		m.ID, m.OrgID, m.StreamID, m.TopicID, m.SenderID,
 		m.Content, m.ContentText, m.Timestamp, nullIfEmpty(m.EditTimestamp),
-		boolToInt(m.HasAttachment), boolToInt(m.HasImage), boolToInt(m.HasLink), string(m.Reactions), boolToInt(m.IsMeMessage),
+		boolToInt(m.HasAttachment), boolToInt(m.HasImage), boolToInt(m.HasLink), reactions, boolToInt(m.IsMeMessage),
 	)
 	return err
 }
@@ -299,10 +297,10 @@ func (s *Store) UpsertMessageBatch(ctx context.Context, msgs []Message) error {
 	if err != nil {
 		return err
 	}
-	for _, m := range msgs {
+	for i, m := range msgs {
 		if err := s.upsertMessageTx(ctx, tx, m); err != nil {
 			_ = tx.Rollback()
-			return err
+			return fmt.Errorf("message %d (id=%d, sender=%d, topic=%d, stream=%d): %w", i, m.ID, m.SenderID, m.TopicID, m.StreamID, err)
 		}
 	}
 	return tx.Commit()
