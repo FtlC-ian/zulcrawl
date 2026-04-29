@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -16,10 +18,28 @@ import (
 )
 
 type Syncer struct {
-	cfg   *config.Config
-	api   *zulip.Client
-	store *store.Store
-	orgID int64
+	cfg    *config.Config
+	api    *zulip.Client
+	store  *store.Store
+	orgID  int64
+	logger *logger
+}
+
+// logger is a minimal progress sink used by the syncer.  By default it writes
+// to os.Stderr so long-running syncs do not appear hung.
+type logger struct {
+	w io.Writer
+}
+
+func newLogger() *logger {
+	return &logger{w: os.Stderr}
+}
+
+func (l *logger) log(format string, args ...any) {
+	if l == nil || l.w == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(l.w, "[zulcrawl] "+format+"\n", args...)
 }
 
 const (
@@ -35,10 +55,19 @@ type Options struct {
 }
 
 func New(cfg *config.Config, api *zulip.Client, st *store.Store) *Syncer {
-	return &Syncer{cfg: cfg, api: api, store: st, orgID: 1}
+	return &Syncer{cfg: cfg, api: api, store: st, orgID: 1, logger: newLogger()}
+}
+
+// NewWithLogger creates a Syncer writing progress to a custom writer.
+// Pass nil to suppress all progress output.
+func NewWithLogger(cfg *config.Config, api *zulip.Client, st *store.Store, w io.Writer) *Syncer {
+	s := New(cfg, api, st)
+	s.logger = &logger{w: w}
+	return s
 }
 
 func (s *Syncer) Sync(ctx context.Context, opts Options) error {
+	s.logger.log("fetching stream list and user roster…")
 	streams, err := s.api.Streams(ctx)
 	if err != nil {
 		return err
@@ -47,6 +76,7 @@ func (s *Syncer) Sync(ctx context.Context, opts Options) error {
 	if err != nil {
 		return err
 	}
+	s.logger.log("upserting %d users", len(users))
 	for _, u := range users {
 		if err := s.store.UpsertUser(ctx, store.User{
 			ID:        u.UserID,
@@ -62,11 +92,15 @@ func (s *Syncer) Sync(ctx context.Context, opts Options) error {
 
 	selected := filterStreams(streams, s.cfg.Sync.Streams, s.cfg.Sync.ExcludeStreams, opts.Streams)
 	if len(selected) > 0 {
+		s.logger.log("%d stream(s) selected for sync", len(selected))
 		if err := s.syncStreams(ctx, selected, opts); err != nil {
 			return err
 		}
+	} else {
+		s.logger.log("no public streams selected; syncing private messages only")
 	}
 
+	s.logger.log("syncing private/direct messages")
 	if err := s.syncPrivateMessages(ctx, opts); err != nil {
 		return fmt.Errorf("private messages: %w", err)
 	}
@@ -138,10 +172,17 @@ func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) 
 			anchor = fmt.Sprintf("%d", last)
 		}
 	}
+	mode := "incremental"
+	if opts.Full || anchor == "oldest" {
+		mode = "full"
+	}
+	s.logger.log("stream %q: starting %s sync (anchor=%s)", st.Name, mode, anchor)
 
 	touched := map[int64]struct{}{}
 	var maxID int64
+	var pageNum int
 	for {
+		pageNum++
 		resp, err := s.api.Messages(ctx, zulip.MessagesRequest{
 			Anchor:    anchor,
 			NumBefore: 0,
@@ -160,6 +201,7 @@ func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) 
 		if len(resp.Messages) == 0 {
 			break
 		}
+		s.logger.log("stream %q: page %d – %d messages (anchor=%s)", st.Name, pageNum, len(resp.Messages), anchor)
 
 		// Build the batch for this page.
 		// Auto-upsert senders from message metadata. The /users endpoint may
@@ -250,6 +292,7 @@ func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) 
 			return err
 		}
 	}
+	s.logger.log("stream %q: done (%d pages)", st.Name, pageNum)
 	return nil
 }
 
@@ -271,10 +314,17 @@ func (s *Syncer) syncPrivateMessages(ctx context.Context, opts Options) error {
 			anchor = fmt.Sprintf("%d", last)
 		}
 	}
+	mode := "incremental"
+	if opts.Full || anchor == "oldest" {
+		mode = "full"
+	}
+	s.logger.log("private messages: starting %s sync (anchor=%s)", mode, anchor)
 
 	touched := map[int64]struct{}{}
 	var maxID int64
+	var pageNum int
 	for {
+		pageNum++
 		resp, err := s.api.Messages(ctx, zulip.MessagesRequest{
 			Anchor:    anchor,
 			NumBefore: 0,
@@ -291,6 +341,7 @@ func (s *Syncer) syncPrivateMessages(ctx context.Context, opts Options) error {
 		if len(resp.Messages) == 0 {
 			break
 		}
+		s.logger.log("private messages: page %d – %d messages (anchor=%s)", pageNum, len(resp.Messages), anchor)
 
 		for _, m := range resp.Messages {
 			if err := s.store.UpsertUser(ctx, store.User{
@@ -367,6 +418,7 @@ func (s *Syncer) syncPrivateMessages(ctx context.Context, opts Options) error {
 			return err
 		}
 	}
+	s.logger.log("private messages: done (%d pages)", pageNum)
 	return nil
 }
 
