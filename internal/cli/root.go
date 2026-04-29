@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/FtlC-ian/zulcrawl/internal/config"
+	"github.com/FtlC-ian/zulcrawl/internal/lock"
 	"github.com/FtlC-ian/zulcrawl/internal/search"
 	"github.com/FtlC-ian/zulcrawl/internal/store"
 	"github.com/FtlC-ian/zulcrawl/internal/syncer"
@@ -165,6 +166,15 @@ func syncCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 			if err := st.InitSchema(ctx); err != nil {
 				return err
 			}
+
+			// Acquire an exclusive lock so two concurrent sync processes do not
+			// write the same archive simultaneously.
+			lockPath := cfg.DBPath() + ".lock"
+			l, err := lock.Acquire(lockPath)
+			if err != nil {
+				return err
+			}
+			defer l.Release()
 
 			api := zulip.NewClient(cfg.Zulip.URL, cfg.Zulip.Email, cfg.Zulip.APIKey)
 			sy := syncer.New(cfg, api, st)
