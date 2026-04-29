@@ -351,9 +351,10 @@ FTS-only behaviour is the default and remains unchanged.`,
 					return err
 				}
 				hits, err := embeddings.SemanticSearch(ctx, st, client, embeddings.SemanticSearchOptions{
-					Query:  args[0],
-					Stream: stream,
-					Limit:  limit,
+					Query:          args[0],
+					Stream:         stream,
+					Limit:          limit,
+					OnlyUnresolved: unresolved,
 				})
 				if err != nil {
 					return err

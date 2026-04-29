@@ -245,6 +245,67 @@ func (s *Store) DeleteEmbeddingsByModel(ctx context.Context, model string) error
 	return err
 }
 
+// EmbeddingEntry combines a stored vector with its topic metadata.
+// Used by FilteredEmbeddings for stream/resolved-scoped semantic search.
+type EmbeddingEntry struct {
+	TopicID       int64
+	StreamName    string
+	TopicName     string
+	Resolved      bool
+	MessageCount  int
+	LastMessageAt string
+	Vec           []float32
+}
+
+// FilteredEmbeddings returns stored embeddings for model, filtered by optional
+// stream name and resolved status. Filtering is applied at the SQL layer so
+// that callers can limit results to a correctly-scoped set without a post-filter
+// that would silently discard relevant in-stream topics below a global cutoff.
+func (s *Store) FilteredEmbeddings(ctx context.Context, model, stream string, onlyUnresolved bool) ([]EmbeddingEntry, error) {
+	q := `
+SELECT te.topic_id, st.name, t.name, t.resolved, t.message_count,
+       COALESCE(t.last_message_at, ''), te.vector
+FROM topic_embeddings te
+JOIN topics t  ON t.id  = te.topic_id
+JOIN streams st ON st.id = t.stream_id
+WHERE te.model = ?`
+	args := []any{model}
+	if stream != "" {
+		q += " AND st.name = ?"
+		args = append(args, stream)
+	}
+	if onlyUnresolved {
+		q += " AND t.resolved = 0"
+	}
+	q += " ORDER BY te.topic_id ASC"
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []EmbeddingEntry
+	for rows.Next() {
+		var e EmbeddingEntry
+		var blob []byte
+		var resolved int
+		if err := rows.Scan(
+			&e.TopicID, &e.StreamName, &e.TopicName,
+			&resolved, &e.MessageCount, &e.LastMessageAt, &blob,
+		); err != nil {
+			return nil, err
+		}
+		e.Resolved = resolved == 1
+		v, err := decodeVec(blob)
+		if err != nil {
+			return nil, fmt.Errorf("store: decode embedding for topic %d: %w", e.TopicID, err)
+		}
+		e.Vec = v
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // TopicMeta returns lightweight metadata for a single topic by ID.
 func (s *Store) TopicMeta(ctx context.Context, topicID int64) (*TopicMetaRow, error) {
 	var r TopicMetaRow

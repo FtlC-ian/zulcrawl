@@ -12,7 +12,6 @@ package embeddings
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"io"
 	"sort"
@@ -105,6 +104,19 @@ func Backfill(ctx context.Context, cfg *config.Config, st *store.Store, client e
 			return result, fmt.Errorf("embeddings: expected %d vectors, got %d", len(validIDs), len(vecs))
 		}
 
+		// P1 fix: validate dimension against stored embeddings after the first
+		// real embed response.  client.Dim() returns 0 until the first Embed call
+		// (OllamaClient lazily sets it), so the pre-flight checkModelMismatch at
+		// the top of Backfill is a no-op on a fresh client.  We catch the mismatch
+		// here — before any writes — using the actual vector length returned by
+		// the model, so mixed-dimension vectors can never be written for the same
+		// model name.
+		if result.Embedded == 0 && len(vecs) > 0 && len(vecs[0]) > 0 {
+			if err := checkModelMismatch(ctx, st, model, len(vecs[0])); err != nil {
+				return result, err
+			}
+		}
+
 		for i, id := range validIDs {
 			if err := st.UpsertTopicEmbedding(ctx, id, model, cfg.Embeddings.Provider, vecs[i]); err != nil {
 				return result, fmt.Errorf("embeddings: store topic %d: %w", id, err)
@@ -134,13 +146,21 @@ type SemanticHit struct {
 
 // SemanticSearchOptions controls semantic search.
 type SemanticSearchOptions struct {
-	Query  string
-	Stream string
-	Limit  int
+	Query          string
+	Stream         string
+	Limit          int
+	// OnlyUnresolved excludes resolved topics from semantic search results.
+	// Mirrors the --unresolved flag available in FTS topic search.
+	OnlyUnresolved bool
 }
 
 // SemanticSearch performs a brute-force cosine similarity search over stored
 // topic embeddings.  It returns an error if no embeddings exist for the model.
+//
+// Filtering by Stream and OnlyUnresolved is pushed to the SQL layer via
+// FilteredEmbeddings so that the limit is applied to the correctly-scoped set.
+// Previously, filtering happened after a global sort+limit, which silently
+// discarded in-stream or unresolved topics that fell below the global cutoff.
 func SemanticSearch(ctx context.Context, st *store.Store, client embed.Client, opts SemanticSearchOptions) ([]SemanticHit, error) {
 	model := client.Model()
 	info, err := st.EmbeddingStats(ctx, model)
@@ -161,28 +181,31 @@ func SemanticSearch(ctx context.Context, st *store.Store, client embed.Client, o
 	}
 	qvec := qvecs[0]
 
-	// Load all vectors.
-	ids, vecs, err := st.AllEmbeddings(ctx, model)
+	// Load embeddings already filtered by stream and resolved status at the SQL
+	// layer.  This is the fix for the stream-filter and unresolved-filter bugs:
+	// sorting and limiting now operate on the correctly-scoped set, not on all
+	// topics globally.
+	entries, err := st.FilteredEmbeddings(ctx, model, opts.Stream, opts.OnlyUnresolved)
 	if err != nil {
-		return nil, fmt.Errorf("embeddings: load embeddings: %w", err)
+		return nil, fmt.Errorf("embeddings: load filtered embeddings: %w", err)
 	}
 
 	// Validate dimension consistency.
-	if len(vecs) > 0 && len(vecs[0]) != len(qvec) {
+	if len(entries) > 0 && len(entries[0].Vec) != len(qvec) {
 		return nil, fmt.Errorf(
 			"embeddings: dimension mismatch — stored vectors have dim=%d but query produced dim=%d.\n"+
 				"This usually means the model changed. Re-embed with:\n  zulcrawl embeddings backfill --force",
-			len(vecs[0]), len(qvec),
+			len(entries[0].Vec), len(qvec),
 		)
 	}
 
 	type scored struct {
-		id    int64
+		entry store.EmbeddingEntry
 		score float64
 	}
-	scores := make([]scored, len(ids))
-	for i, v := range vecs {
-		scores[i] = scored{id: ids[i], score: embed.CosineSimilarity(qvec, v)}
+	scores := make([]scored, len(entries))
+	for i, e := range entries {
+		scores[i] = scored{entry: e, score: embed.CosineSimilarity(qvec, e.Vec)}
 	}
 	sort.Slice(scores, func(i, j int) bool { return scores[i].score > scores[j].score })
 
@@ -194,26 +217,15 @@ func SemanticSearch(ctx context.Context, st *store.Store, client embed.Client, o
 		scores = scores[:limit]
 	}
 
-	// Fetch topic metadata for results.
 	out := make([]SemanticHit, 0, len(scores))
 	for _, s := range scores {
-		meta, err := st.TopicMeta(ctx, s.id)
-		if err == sql.ErrNoRows {
-			continue
-		}
-		if err != nil {
-			return nil, fmt.Errorf("embeddings: get topic meta %d: %w", s.id, err)
-		}
-		if opts.Stream != "" && meta.StreamName != opts.Stream {
-			continue
-		}
 		out = append(out, SemanticHit{
-			TopicID:       s.id,
-			StreamName:    meta.StreamName,
-			TopicName:     meta.TopicName,
-			Resolved:      meta.Resolved,
-			MessageCount:  meta.MessageCount,
-			LastMessageAt: meta.LastMessageAt,
+			TopicID:       s.entry.TopicID,
+			StreamName:    s.entry.StreamName,
+			TopicName:     s.entry.TopicName,
+			Resolved:      s.entry.Resolved,
+			MessageCount:  s.entry.MessageCount,
+			LastMessageAt: s.entry.LastMessageAt,
 			Score:         s.score,
 		})
 	}

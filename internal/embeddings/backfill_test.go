@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/FtlC-ian/zulcrawl/internal/config"
@@ -163,5 +164,133 @@ func TestSemanticSearch_NoEmbeddings(t *testing.T) {
 	_, err := SemanticSearch(ctx, st, client, SemanticSearchOptions{Query: "test"})
 	if err == nil {
 		t.Fatal("expected error when no embeddings exist")
+	}
+}
+
+// seedTopicsMultiStream seeds topics across two streams (general / dev) and
+// returns (generalTopicIDs, devTopicIDs).  Both streams must exist in the db;
+// the standard setupEmbedTest already creates stream 10 ("general"), so here we
+// also add stream 11 ("dev").
+func seedTopicsMultiStream(t *testing.T, st *store.Store, ctx context.Context) ([]int64, []int64) {
+	t.Helper()
+	if err := st.UpsertStream(ctx, store.Stream{ID: 11, OrgID: 1, Name: "dev"}); err != nil {
+		t.Fatalf("UpsertStream dev: %v", err)
+	}
+	generalNames := []string{"general topic 1", "general topic 2", "general topic 3"}
+	devNames := []string{"dev topic alpha", "dev topic beta"}
+
+	msgID := int64(7000)
+	seedInStream := func(streamID int64, names []string) []int64 {
+		ids := make([]int64, 0, len(names))
+		for _, name := range names {
+			id, err := st.GetOrCreateTopic(ctx, 1, streamID, name)
+			if err != nil {
+				t.Fatalf("GetOrCreateTopic %q: %v", name, err)
+			}
+			if err := st.UpsertMessage(ctx, store.Message{
+				ID: msgID, OrgID: 1, StreamID: streamID, TopicID: id,
+				SenderID: 20, Content: "content " + name, ContentText: "content " + name,
+				Timestamp: "2026-04-29T10:00:00Z",
+			}); err != nil {
+				t.Fatalf("UpsertMessage for %q: %v", name, err)
+			}
+			msgID++
+			ids = append(ids, id)
+		}
+		return ids
+	}
+	return seedInStream(10, generalNames), seedInStream(11, devNames)
+}
+
+// TestSemanticSearch_StreamFilter verifies that the stream filter is applied
+// before sorting/limiting so that in-stream topics below a global cutoff are
+// not silently dropped.
+func TestSemanticSearch_StreamFilter(t *testing.T) {
+	st, cfg, ctx := setupEmbedTest(t)
+	_, devIDs := seedTopicsMultiStream(t, st, ctx)
+
+	client := embed.NewFakeClient("fake-model", 8)
+	if _, err := Backfill(ctx, cfg, st, client, BackfillOptions{}, io.Discard); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+
+	// Ask for only 2 results scoped to the "dev" stream; there are exactly 2
+	// dev topics so both should be returned regardless of global rank.
+	hits, err := SemanticSearch(ctx, st, client, SemanticSearchOptions{
+		Query:  "topic content",
+		Stream: "dev",
+		Limit:  2,
+	})
+	if err != nil {
+		t.Fatalf("SemanticSearch: %v", err)
+	}
+	if len(hits) != len(devIDs) {
+		t.Fatalf("expected %d hits for stream=dev, got %d", len(devIDs), len(hits))
+	}
+	for _, h := range hits {
+		if h.StreamName != "dev" {
+			t.Errorf("expected stream=dev, got %q", h.StreamName)
+		}
+	}
+}
+
+// TestSemanticSearch_OnlyUnresolved verifies that resolved topics are excluded
+// when OnlyUnresolved is true, mirroring the behaviour of FTS topic search.
+func TestSemanticSearch_OnlyUnresolved(t *testing.T) {
+	st, cfg, ctx := setupEmbedTest(t)
+	// Seed three topics; mark the first one resolved.
+	ids := seedTopics(t, st, ctx, "resolved topic", "open topic A", "open topic B")
+	if err := st.SetTopicResolved(ctx, ids[0], true); err != nil {
+		t.Fatalf("mark resolved: %v", err)
+	}
+
+	client := embed.NewFakeClient("fake-model", 8)
+	if _, err := Backfill(ctx, cfg, st, client, BackfillOptions{}, io.Discard); err != nil {
+		t.Fatalf("Backfill: %v", err)
+	}
+
+	hits, err := SemanticSearch(ctx, st, client, SemanticSearchOptions{
+		Query:          "topic",
+		Limit:          10,
+		OnlyUnresolved: true,
+	})
+	if err != nil {
+		t.Fatalf("SemanticSearch OnlyUnresolved: %v", err)
+	}
+	for _, h := range hits {
+		if h.Resolved {
+			t.Errorf("OnlyUnresolved=true but got resolved topic %q", h.TopicName)
+		}
+	}
+	if len(hits) != 2 {
+		t.Errorf("expected 2 unresolved hits, got %d", len(hits))
+	}
+}
+
+// TestBackfill_DimensionMismatchAfterFirstEmbed exercises the P1 fix:
+// when stored embeddings exist under a different dimension for the same model
+// name, Backfill must abort before writing any new vectors, even though
+// client.Dim() returns 0 on construction (i.e. before the first embed call).
+func TestBackfill_DimensionMismatchAfterFirstEmbed(t *testing.T) {
+	st, cfg, ctx := setupEmbedTest(t)
+	// Seed and embed two topics with dim=4.
+	seedTopics(t, st, ctx, "existing A", "existing B")
+	clientDim4 := embed.NewFakeClient("shared-model", 4)
+	cfg.Embeddings.Model = "shared-model"
+	if _, err := Backfill(ctx, cfg, st, clientDim4, BackfillOptions{}, io.Discard); err != nil {
+		t.Fatalf("initial backfill: %v", err)
+	}
+
+	// Now add a new topic that hasn't been embedded yet.
+	seedTopics(t, st, ctx, "new topic")
+
+	// Try to backfill with a client that returns dim=8 vectors for the same model.
+	clientDim8 := embed.NewFakeClient("shared-model", 8)
+	_, err := Backfill(ctx, cfg, st, clientDim8, BackfillOptions{}, io.Discard)
+	if err == nil {
+		t.Fatal("expected dimension mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "dimension mismatch") {
+		t.Errorf("expected 'dimension mismatch' in error, got: %v", err)
 	}
 }
