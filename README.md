@@ -18,6 +18,9 @@
   - `sql`
   - `messages` — direct archive slice queries (see below)
   - `backfill-indexes` — rebuild mention/attachment indexes for existing messages
+  - `embeddings backfill` — build/update Ollama topic embeddings (disabled by default)
+  - `embeddings status` — show embedding coverage
+  - `topics search --semantic` — vector/semantic topic search when embeddings enabled
 - Syncer with parallel stream workers and incremental sync (`sync_state`)
 - HTML-to-text conversion for indexing
 - Search ranking with FTS BM25, resolved-topic boost, and recency boost
@@ -197,8 +200,79 @@ Output format per message:
 
 ```
 
-## Notes
-
 - Uses `modernc.org/sqlite` (pure Go, no CGO)
 - Current implementation focuses on core mirror/search flow
-- Planned later (per spec): tail/event queue, MCP server, vector-embedding semantic search (pluggable provider, off by default), summarization, Q&A extraction
+- Planned later (per spec): tail/event queue, MCP server, summarization, Q&A extraction
+
+## Semantic Search (optional, Ollama embeddings)
+
+Embeddings are **disabled by default**. No embedding calls are ever made unless you explicitly enable them.
+
+### Quick-start
+
+```bash
+# 1. Add to ~/.zulcrawl/config.toml
+cat >> ~/.zulcrawl/config.toml <<'EOF'
+[embeddings]
+enabled   = true
+model     = "nomic-embed-text-v2-moe"   # recommended; ~550 MB
+# provider   = "ollama"                 # only supported provider
+# ollama_base = "http://localhost:11434" # default
+# batch_size  = 32                      # texts per /api/embed request
+# sample_messages = 50                  # messages sampled per topic
+EOF
+
+# 2. Start Ollama and pull the model
+ollama serve &
+ollama pull nomic-embed-text-v2-moe
+
+# 3. Build embeddings for all topics
+zulcrawl embeddings backfill
+
+# 4. Semantic topic search
+zulcrawl topics search --semantic "database migration strategy"
+```
+
+### Notes and limitations
+
+- **First-run latency**: embedding a large archive (thousands of topics) may take
+  several minutes on first run. Subsequent incremental runs only embed new topics.
+- **No cloud calls**: all embeddings are generated locally via Ollama.
+- **No Python**: pure Go implementation using Ollama's HTTP API.
+- **No sqlite-vec / HNSW**: brute-force cosine similarity is used. This is fast
+  enough for typical Zulip archive sizes.
+- **Heavier alternative**: `bge-m3` can be used instead of `nomic-embed-text-v2-moe`
+  for potentially better recall on multilingual corpora; pull and update config.
+- **Model change**: if you switch models, re-embed everything with:
+  `zulcrawl embeddings backfill --force`
+- **Dimension mismatch**: mixing vectors from different models produces wrong
+  results. zulcrawl detects this and emits a clear error asking you to re-embed.
+
+### Commands
+
+```bash
+# Build/update embeddings
+zulcrawl embeddings backfill
+zulcrawl embeddings backfill --batch 16   # smaller batches for low RAM
+zulcrawl embeddings backfill --limit 500  # embed at most N topics
+zulcrawl embeddings backfill --force      # re-embed everything (model change)
+
+# Check embedding coverage
+zulcrawl embeddings status
+
+# Semantic topic search
+zulcrawl topics search --semantic "deploy pipeline"
+zulcrawl topics search --semantic --stream engineering "API rate limit"
+```
+
+### `topics search` flags (updated)
+
+| Flag | Description |
+|------|-------------|
+| `--stream NAME` | Filter by stream name |
+| `--unresolved` | Exclude resolved topics |
+| `--limit N` | Maximum topics to return (default 20) |
+| `--semantic` | Use Ollama vector search (requires embeddings enabled + backfilled) |
+
+FTS-only behaviour is **unchanged** when `--semantic` is not set.
+

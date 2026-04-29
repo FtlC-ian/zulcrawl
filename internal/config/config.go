@@ -31,6 +31,24 @@ type Config struct {
 		SemanticEnabled bool   `toml:"semantic_enabled"`
 		EmbeddingModel  string `toml:"embedding_model"`
 	} `toml:"search"`
+	Embeddings struct {
+		// Enabled controls whether embedding features are compiled-in and available.
+		// Default: false. No embedding calls are made unless this is true.
+		Enabled bool `toml:"enabled"`
+		// Provider selects the embedding backend. Only "ollama" is supported.
+		Provider string `toml:"provider"`
+		// OllamaBase is the Ollama server base URL. Defaults to http://localhost:11434.
+		OllamaBase string `toml:"ollama_base"`
+		// Model is the embedding model name, e.g. "nomic-embed-text-v2-moe".
+		// Pull it first: ollama pull nomic-embed-text-v2-moe
+		Model string `toml:"model"`
+		// BatchSize is the number of texts per Ollama /api/embed request.
+		// Defaults to 32.
+		BatchSize int `toml:"batch_size"`
+		// SampleMessages is the number of messages sampled per topic when
+		// building its embedding text. Defaults to 50.
+		SampleMessages int `toml:"sample_messages"`
+	} `toml:"embeddings"`
 	MCP struct {
 		Enabled bool `toml:"enabled"`
 		Port    int  `toml:"port"`
@@ -45,6 +63,12 @@ func Default() *Config {
 	c.Sync.ExcludeStreams = []string{"social", "random"}
 	c.Tail.RepairInterval = "30m"
 	c.MCP.Port = 8849
+	c.Embeddings.Enabled = false
+	c.Embeddings.Provider = "ollama"
+	c.Embeddings.OllamaBase = "http://localhost:11434"
+	c.Embeddings.Model = "nomic-embed-text-v2-moe"
+	c.Embeddings.BatchSize = 32
+	c.Embeddings.SampleMessages = 50
 	return c
 }
 

@@ -12,6 +12,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/FtlC-ian/zulcrawl/internal/config"
+	"github.com/FtlC-ian/zulcrawl/internal/embed"
+	"github.com/FtlC-ian/zulcrawl/internal/embeddings"
 	"github.com/FtlC-ian/zulcrawl/internal/lock"
 	"github.com/FtlC-ian/zulcrawl/internal/search"
 	"github.com/FtlC-ian/zulcrawl/internal/store"
@@ -40,6 +42,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(sqlCmd(loadCfg))
 	root.AddCommand(messagesCmd(loadCfg))
 	root.AddCommand(backfillIndexesCmd(loadCfg))
+	root.AddCommand(embeddingsCmd(loadCfg))
 	return root
 }
 
@@ -294,6 +297,7 @@ func topicsSearchCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 	var stream string
 	var unresolved bool
 	var limit int
+	var semantic bool
 	cmd := &cobra.Command{
 		Use:   "search [query]",
 		Short: "Hybrid topic-level search (FTS on topic names + message content)",
@@ -306,7 +310,14 @@ Results are ranked by:
   - Resolved bonus: resolved topics get a small lift
 
 This is a purely local FTS/hybrid search. No remote embedding APIs are called.
-Embedding-provider integration is left for a future chunk (see issue #9).`,
+
+When --semantic is set, semantic/vector scoring participates alongside FTS.
+This requires embeddings to be enabled and backfilled:
+  1. Set [embeddings] enabled = true in config
+  2. ollama pull nomic-embed-text-v2-moe
+  3. zulcrawl embeddings backfill
+
+FTS-only behaviour is the default and remains unchanged.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadCfg()
@@ -318,6 +329,55 @@ Embedding-provider integration is left for a future chunk (see issue #9).`,
 				return err
 			}
 			defer st.Close()
+
+			// --- Semantic mode ---------------------------------------------------
+			if semantic {
+				if !cfg.Embeddings.Enabled {
+					return fmt.Errorf(
+						"semantic search requires embeddings to be enabled.\n" +
+							"Set [embeddings] enabled = true in config, then run:\n" +
+							"  ollama pull %s\n" +
+							"  zulcrawl embeddings backfill",
+						cfg.Embeddings.Model)
+				}
+				client := embed.NewOllamaClient(
+					cfg.Embeddings.OllamaBase,
+					cfg.Embeddings.Model,
+					cfg.Embeddings.BatchSize,
+				)
+				ctx, cancel := context.WithTimeout(cmd.Context(), 60*time.Second)
+				defer cancel()
+				if err := client.CheckAvailable(ctx); err != nil {
+					return err
+				}
+				hits, err := embeddings.SemanticSearch(ctx, st, client, embeddings.SemanticSearchOptions{
+					Query:  args[0],
+					Stream: stream,
+					Limit:  limit,
+				})
+				if err != nil {
+					return err
+				}
+				if len(hits) == 0 {
+					fmt.Fprintln(cmd.OutOrStdout(), "No topics found.")
+					return nil
+				}
+				for _, h := range hits {
+					res := ""
+					if h.Resolved {
+						res = " [resolved]"
+					}
+					lastAt := h.LastMessageAt
+					if t, err2 := time.Parse(time.RFC3339, h.LastMessageAt); err2 == nil {
+						lastAt = t.Format("2006-01-02")
+					}
+					fmt.Fprintf(cmd.OutOrStdout(), "#%s > %s%s (%d msgs, last %s, score %.3f)\n",
+						h.StreamName, h.TopicName, res, h.MessageCount, lastAt, h.Score)
+				}
+				return nil
+			}
+
+			// --- FTS mode (default) ---------------------------------------------
 			hits, err := st.SearchTopics(cmd.Context(), store.TopicSearchOptions{
 				Query:          args[0],
 				Stream:         stream,
@@ -353,6 +413,7 @@ Embedding-provider integration is left for a future chunk (see issue #9).`,
 	cmd.Flags().StringVar(&stream, "stream", "", "filter by stream name")
 	cmd.Flags().BoolVar(&unresolved, "unresolved", false, "only unresolved topics")
 	cmd.Flags().IntVar(&limit, "limit", 20, "max topics to return")
+	cmd.Flags().BoolVar(&semantic, "semantic", false, "use semantic/vector search (requires embeddings enabled + backfilled)")
 	return cmd
 }
 
@@ -646,4 +707,171 @@ func flatString(m map[string]any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// embeddingsCmd is the parent command for embedding management.
+func embeddingsCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "embeddings",
+		Short: "Manage topic embeddings (Ollama, disabled by default)",
+		Long: `Manage local topic embeddings for semantic/vector search.
+
+Embeddings are DISABLED by default. No calls are made to Ollama or any remote
+service unless you explicitly enable them in config.
+
+To enable:
+  1. Edit ~/.zulcrawl/config.toml and add:
+       [embeddings]
+       enabled = true
+       model   = "nomic-embed-text-v2-moe"
+  2. Start Ollama:   ollama serve
+  3. Pull the model: ollama pull nomic-embed-text-v2-moe
+  4. Run backfill:   zulcrawl embeddings backfill
+  5. Search:         zulcrawl topics search --semantic "your query"
+
+First-run latency depends on the model and corpus size. Subsequent incremental
+backfills only embed newly-added topics.`,
+	}
+	cmd.AddCommand(embeddingsBackfillCmd(loadCfg))
+	cmd.AddCommand(embeddingsStatusCmd(loadCfg))
+	return cmd
+}
+
+func embeddingsBackfillCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
+	var batchSize int
+	var limit int
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "backfill",
+		Short: "Build or update topic embeddings",
+		Long: `Embed all topics that do not yet have a stored vector for the configured model.
+
+Requires:
+  - [embeddings] enabled = true in config
+  - Ollama running: ollama serve
+  - Model pulled:   ollama pull <model>
+
+Backfill is incremental: only topics without an existing embedding are processed.
+Use --force to re-embed all topics (e.g. after changing the model).
+
+Note: on first run with a large archive the process may take several minutes.
+Progress is printed as batches complete.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadCfg()
+			if err != nil {
+				return err
+			}
+			if !cfg.Embeddings.Enabled {
+				return fmt.Errorf(
+					"embeddings are disabled.\n" +
+						"Set [embeddings] enabled = true in config, then:\n" +
+						"  ollama pull %s",
+					cfg.Embeddings.Model)
+			}
+
+			lockPath := cfg.DBPath() + ".lock"
+			l, err := lock.Acquire(lockPath)
+			if err != nil {
+				return err
+			}
+			defer l.Release()
+
+			st, err := store.Open(cfg.DBPath())
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			ctx := cmd.Context()
+			if err := st.InitSchema(ctx); err != nil {
+				return err
+			}
+
+			if batchSize > 0 {
+				cfg.Embeddings.BatchSize = batchSize
+			}
+
+			client := embed.NewOllamaClient(
+				cfg.Embeddings.OllamaBase,
+				cfg.Embeddings.Model,
+				cfg.Embeddings.BatchSize,
+			)
+
+			// Verify Ollama is reachable and model is present before doing any work.
+			checkCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			if err := client.CheckAvailable(checkCtx); err != nil {
+				return err
+			}
+
+			if force {
+				// Drop all stored embeddings for this model so backfill re-embeds everything.
+				fmt.Fprintf(os.Stderr, "--force: clearing existing embeddings for model %q\n", cfg.Embeddings.Model)
+				if err := st.DeleteEmbeddingsByModel(ctx, cfg.Embeddings.Model); err != nil {
+					return fmt.Errorf("clear embeddings: %w", err)
+				}
+			}
+
+			_, err = embeddings.Backfill(ctx, cfg, st, client, embeddings.BackfillOptions{
+				BatchSize: batchSize,
+				Limit:     limit,
+			}, os.Stdout)
+			return err
+		},
+	}
+	cmd.Flags().IntVar(&batchSize, "batch", 0, "override batch size from config")
+	cmd.Flags().IntVar(&limit, "limit", 0, "only embed this many topics (0 = all)")
+	cmd.Flags().BoolVar(&force, "force", false, "re-embed all topics, even if already embedded")
+	return cmd
+}
+
+func embeddingsStatusCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Show embedding coverage for the configured model",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadCfg()
+			if err != nil {
+				return err
+			}
+			if !cfg.Embeddings.Enabled {
+				fmt.Println("embeddings: disabled (set [embeddings] enabled = true to activate)")
+				return nil
+			}
+			st, err := store.Open(cfg.DBPath())
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			ctx := cmd.Context()
+
+			info, err := st.EmbeddingStats(ctx, cfg.Embeddings.Model)
+			if err != nil {
+				return err
+			}
+			stats, err := st.Stats(ctx)
+			if err != nil {
+				return err
+			}
+
+			fmt.Printf("embeddings status\n")
+			fmt.Printf("  enabled:  %v\n", cfg.Embeddings.Enabled)
+			fmt.Printf("  model:    %s\n", cfg.Embeddings.Model)
+			fmt.Printf("  provider: %s\n", cfg.Embeddings.Provider)
+			fmt.Printf("  base:     %s\n", cfg.Embeddings.OllamaBase)
+			fmt.Printf("  topics total: %d\n", stats.Topics)
+			if info != nil {
+				fmt.Printf("  embedded:     %d\n", info.Count)
+				fmt.Printf("  dimension:    %d\n", info.Dim)
+				missing := stats.Topics - info.Count
+				fmt.Printf("  missing:      %d\n", missing)
+				if missing > 0 {
+					fmt.Println("  hint: run `zulcrawl embeddings backfill` to embed missing topics")
+				}
+			} else {
+				fmt.Println("  embedded:     0 (no embeddings yet)")
+				fmt.Println("  hint: run `zulcrawl embeddings backfill` to get started")
+			}
+			return nil
+		},
+	}
 }

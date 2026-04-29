@@ -195,9 +195,11 @@ END;
 		return err
 	}
 	if ftsMigrated {
-		return s.ReindexFTS(ctx)
+		if err := s.ReindexFTS(ctx); err != nil {
+			return err
+		}
 	}
-	return nil
+	return s.InitEmbeddingSchema(ctx)
 }
 
 func (s *Store) prepareFTSMigration(ctx context.Context) (bool, error) {
