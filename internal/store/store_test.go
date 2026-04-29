@@ -120,3 +120,66 @@ func TestUpsertMessageReplacesMentionAndAttachmentRows(t *testing.T) {
 		t.Fatalf("new attachment text hits = %d, want 1", len(hits))
 	}
 }
+
+func TestEnsureMessageSenderPreservesExistingFields(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	// First insert a full user record via UpsertUser (as the roster sync would).
+	if err := st.UpsertUser(ctx, User{
+		ID:        50,
+		OrgID:     1,
+		Email:     "alice@example.com",
+		FullName:  "Alice Roster",
+		IsBot:     false,
+		AvatarURL: "https://example.com/avatar.png",
+	}); err != nil {
+		t.Fatalf("UpsertUser: %v", err)
+	}
+
+	// Now simulate the message-sender auto-upsert with sparse data (no email/avatar).
+	if err := st.EnsureMessageSender(ctx, User{
+		ID:       50,
+		OrgID:    1,
+		FullName: "Alice Updated Name",
+		// Email, AvatarURL, IsBot are zero — should NOT overwrite existing values.
+	}); err != nil {
+		t.Fatalf("EnsureMessageSender: %v", err)
+	}
+
+	var email, avatar, fullName string
+	var isBot int
+	if err := st.db.QueryRowContext(ctx, `SELECT email, full_name, is_bot, avatar_url FROM users WHERE id=50`).Scan(&email, &fullName, &isBot, &avatar); err != nil {
+		t.Fatalf("query user: %v", err)
+	}
+	if fullName != "Alice Updated Name" {
+		t.Errorf("full_name = %q, want %q", fullName, "Alice Updated Name")
+	}
+	if email != "alice@example.com" {
+		t.Errorf("email = %q, want preserved %q", email, "alice@example.com")
+	}
+	if avatar != "https://example.com/avatar.png" {
+		t.Errorf("avatar_url = %q, want preserved", avatar)
+	}
+	if isBot != 0 {
+		t.Errorf("is_bot = %d, want 0 (preserved)", isBot)
+	}
+}
+
+func TestEnsureMessageSenderInsertsNewUser(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	// A user not in the roster yet — only message metadata available.
+	if err := st.EnsureMessageSender(ctx, User{
+		ID:       99,
+		OrgID:    1,
+		FullName: "Ghost Bot",
+	}); err != nil {
+		t.Fatalf("EnsureMessageSender: %v", err)
+	}
+
+	var fullName string
+	if err := st.db.QueryRowContext(ctx, `SELECT full_name FROM users WHERE id=99`).Scan(&fullName); err != nil {
+		t.Fatalf("query user: %v", err)
+	}
+	if fullName != "Ghost Bot" {
+		t.Errorf("full_name = %q, want %q", fullName, "Ghost Bot")
+	}
+}

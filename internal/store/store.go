@@ -293,6 +293,26 @@ email=excluded.email, full_name=excluded.full_name, is_bot=excluded.is_bot, avat
 	return err
 }
 
+// EnsureMessageSender upserts a user record derived from message metadata
+// (sender_id + sender_full_name). Unlike UpsertUser it preserves existing
+// non-empty fields (email, avatar_url, is_bot) so that a full-roster sync
+// does not get overwritten by the sparse data carried in message headers.
+// Only full_name is always refreshed because it is the only field reliably
+// present in every message.
+func (s *Store) EnsureMessageSender(ctx context.Context, u User) error {
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO users(id, org_id, email, full_name, is_bot, avatar_url, synced_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+  full_name = excluded.full_name,
+  email     = CASE WHEN excluded.email     != '' THEN excluded.email     ELSE email     END,
+  avatar_url= CASE WHEN excluded.avatar_url!= '' THEN excluded.avatar_url ELSE avatar_url END,
+  is_bot    = CASE WHEN excluded.is_bot    != 0  THEN excluded.is_bot    ELSE is_bot    END,
+  synced_at = excluded.synced_at
+`, u.ID, u.OrgID, u.Email, u.FullName, boolToInt(u.IsBot), u.AvatarURL, now())
+	return err
+}
+
 func topicResolved(name string) bool {
 	t := strings.TrimSpace(name)
 	return strings.HasPrefix(t, "✔") || strings.HasPrefix(strings.ToLower(t), "[resolved]")
