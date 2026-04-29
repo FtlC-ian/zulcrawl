@@ -39,6 +39,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(statsCmd(loadCfg))
 	root.AddCommand(sqlCmd(loadCfg))
 	root.AddCommand(messagesCmd(loadCfg))
+	root.AddCommand(backfillIndexesCmd(loadCfg))
 	return root
 }
 
@@ -466,6 +467,43 @@ The default safety limit is 200 messages; use --limit or --all to override.`,
 	cmd.Flags().IntVar(&last, "last", 0, "return the N most recent messages (oldest-first output)")
 	cmd.Flags().IntVar(&limit, "limit", 200, "maximum messages to return (default 200)")
 	cmd.Flags().BoolVar(&all, "all", false, "remove safety limit and return all matching messages")
+	return cmd
+}
+
+func backfillIndexesCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
+	var batchSize int
+	cmd := &cobra.Command{
+		Use:   "backfill-indexes",
+		Short: "Rebuild mention and attachment indexes for existing messages",
+		Long: `Reparse stored rendered HTML in messages.content to rebuild:
+
+  • message_mentions  – @-mentions extracted from each message
+  • message_attachments – /user_uploads/ links and any inline text preview
+  • messages_fts.attachment_text – so attachment content participates in search
+
+Useful after a schema migration that introduced these tables when the archive
+already contained messages. Runs in batches (default 200 per transaction) and
+prints progress to stderr. Idempotent: running twice leaves the same result.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadCfg()
+			if err != nil {
+				return err
+			}
+			st, err := store.Open(cfg.DBPath())
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			ctx := cmd.Context()
+			if err := st.InitSchema(ctx); err != nil {
+				return err
+			}
+			return syncer.BackfillIndexes(ctx, st, syncer.BackfillOptions{
+				BatchSize: batchSize,
+			}, os.Stderr)
+		},
+	}
+	cmd.Flags().IntVar(&batchSize, "batch", 200, "number of messages per transaction")
 	return cmd
 }
 
