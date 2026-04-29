@@ -30,3 +30,14 @@ func TestParseMessageIndexablesDoesNotIndexBinaryUploadText(t *testing.T) {
 		t.Fatalf("binary attachment should not be text-indexed: %#v", attachments[0])
 	}
 }
+
+func TestParseMessageIndexablesSkipsWildcardUserMentions(t *testing.T) {
+	html := `<p>Hello <span class="user-mention" data-user-id="*">@all</span> and <span class="user-mention" data-user-id="42">@Alice</span></p>`
+	mentions, _ := parseMessageIndexables(100, 1, 10, 20, "2026-04-29T17:00:00Z", html)
+	if len(mentions) != 1 {
+		t.Fatalf("mentions = %#v, want only concrete user mention", mentions)
+	}
+	if mentions[0].UserID != 42 || mentions[0].Name != "Alice" {
+		t.Fatalf("mention = %#v", mentions[0])
+	}
+}

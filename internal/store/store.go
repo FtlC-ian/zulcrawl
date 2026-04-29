@@ -364,7 +364,15 @@ type Message struct {
 }
 
 func (s *Store) UpsertMessage(ctx context.Context, m Message) error {
-	return s.upsertMessageTx(ctx, s.db, m)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := s.upsertMessageTx(ctx, tx, m); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 // upsertMessageTx is the shared implementation used by both UpsertMessage and

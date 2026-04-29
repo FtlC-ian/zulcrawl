@@ -87,7 +87,10 @@ func isMentionNode(n *html.Node) bool {
 		return false
 	}
 	cls := " " + strings.ToLower(attr(n, "class")) + " "
-	return strings.Contains(cls, " user-mention ") || strings.Contains(cls, " user-group-mention ")
+	if strings.Contains(cls, " user-mention ") {
+		return mentionUserID(n) > 0
+	}
+	return strings.Contains(cls, " user-group-mention ")
 }
 
 func mentionKind(n *html.Node) string {
