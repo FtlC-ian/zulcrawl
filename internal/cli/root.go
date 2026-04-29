@@ -382,27 +382,42 @@ The default safety limit is 200 messages; use --limit or --all to override.`,
 						"  Use --all to fetch the entire archive (may be very large)")
 			}
 
-			// Validate --since / --until formats.
+			if days < 0 {
+				return fmt.Errorf("--days must be positive")
+			}
+			if hours < 0 {
+				return fmt.Errorf("--hours must be positive")
+			}
+			if last < 0 {
+				return fmt.Errorf("--last must be positive")
+			}
+			if limit <= 0 && !all {
+				return fmt.Errorf("--limit must be positive unless --all is set")
+			}
+
+			// Validate --since / --until formats and normalize all values to the
+			// UTC RFC3339 strings stored in SQLite. Lexicographic comparisons only
+			// work correctly when equivalent instants use the same zone.
 			for flagName, val := range map[string]string{"since": since, "until": until} {
 				if val == "" {
 					continue
 				}
-				// Accept RFC3339 or YYYY-MM-DD.
-				if _, err := time.Parse(time.RFC3339, val); err != nil {
-					if _, err2 := time.Parse("2006-01-02", val); err2 != nil {
-						return fmt.Errorf("--%s must be RFC3339 (2006-01-02T15:04:05Z) or YYYY-MM-DD, got %q", flagName, val)
-					}
-					// Expand YYYY-MM-DD to start of day.
+				if t, err := time.Parse(time.RFC3339, val); err == nil {
 					if flagName == "since" {
-						since = val + "T00:00:00Z"
+						since = t.UTC().Format(time.RFC3339)
 					} else {
-						until = val + "T23:59:59Z"
+						until = t.UTC().Format(time.RFC3339)
 					}
+					continue
 				}
-			}
-
-			if all {
-				limit = 0 // 0 = no cap (store uses 0 to mean "no override")
+				if _, err := time.Parse("2006-01-02", val); err != nil {
+					return fmt.Errorf("--%s must be RFC3339 (2006-01-02T15:04:05Z) or YYYY-MM-DD, got %q", flagName, val)
+				}
+				if flagName == "since" {
+					since = val + "T00:00:00Z"
+				} else {
+					until = val + "T23:59:59Z"
+				}
 			}
 
 			f := store.MessagesFilter{
@@ -507,5 +522,3 @@ func flatString(m map[string]any, keys ...string) string {
 	}
 	return ""
 }
-
-

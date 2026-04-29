@@ -214,3 +214,32 @@ func TestMessagesCmd_All(t *testing.T) {
 
 // Verify config package is referenced (avoids unused import warning).
 var _ = config.DefaultPath
+
+func TestMessagesCommandNormalizesRFC3339Offsets(t *testing.T) {
+	cfgPath := setupCLITest(t)
+
+	out, err := runMessages(t, cfgPath, "--since", "2026-01-01T05:30:00-06:00", "--until", "2026-01-01T05:30:00-06:00")
+	if err != nil {
+		t.Fatalf("unexpected error for RFC3339 offset: %v", err)
+	}
+	if !strings.Contains(out, "No messages found") {
+		t.Errorf("expected normalized offset query to run and find no messages, got: %s", out)
+	}
+}
+
+func TestMessagesCommandRejectsNegativeCounts(t *testing.T) {
+	cfgPath := setupCLITest(t)
+
+	cases := [][]string{
+		{"--days", "-1"},
+		{"--hours", "-1"},
+		{"--last", "-1"},
+		{"--stream", "general", "--limit", "0"},
+	}
+	for _, tc := range cases {
+		_, err := runMessages(t, cfgPath, tc...)
+		if err == nil {
+			t.Fatalf("expected error for args %v", tc)
+		}
+	}
+}
