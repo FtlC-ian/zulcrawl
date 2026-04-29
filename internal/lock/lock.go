@@ -34,15 +34,16 @@ func Acquire(path string) (*Lock, error) {
 	return &Lock{f: f}, nil
 }
 
-// Release unlocks and removes the lock file.  It is safe to call Release
-// more than once; the second call is a no-op.
+// Release unlocks and closes the lock file.  It intentionally leaves the
+// lock file on disk: removing a flock file can create split-brain locks when
+// another process holds the old inode and a third process creates a new file
+// at the same path.  It is safe to call Release more than once; the second
+// call is a no-op.
 func (l *Lock) Release() {
 	if l == nil || l.f == nil {
 		return
 	}
 	_ = syscall.Flock(int(l.f.Fd()), syscall.LOCK_UN)
-	name := l.f.Name()
 	_ = l.f.Close()
-	_ = os.Remove(name)
 	l.f = nil
 }

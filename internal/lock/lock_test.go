@@ -38,7 +38,7 @@ func TestDoubleLockFails(t *testing.T) {
 	}
 }
 
-func TestLockFileRemovedOnRelease(t *testing.T) {
+func TestLockFileRemainsOnRelease(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.lock")
 
@@ -47,8 +47,8 @@ func TestLockFileRemovedOnRelease(t *testing.T) {
 		t.Fatalf("Acquire failed: %v", err)
 	}
 	l.Release()
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Errorf("lock file should be removed after Release")
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("lock file should remain after Release, got: %v", err)
 	}
 }
 
