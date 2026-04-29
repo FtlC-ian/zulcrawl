@@ -358,3 +358,22 @@ func TestQueryMessages_SenderEscapesLikeWildcards(t *testing.T) {
 		t.Fatalf("expected only literal underscore sender, got %#v", rows)
 	}
 }
+
+func TestMessageRowsForBackfillBoundsToMaxID(t *testing.T) {
+	st := openTestStore(t)
+	defer st.Close()
+	seedDB(t, st)
+
+	rows, err := st.MessageRowsForBackfill(context.Background(), 0, 2000, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if row.ID > 2000 {
+			t.Fatalf("row %d is outside snapshot max id", row.ID)
+		}
+	}
+	if len(rows) == 0 {
+		t.Fatal("expected bounded backfill rows")
+	}
+}

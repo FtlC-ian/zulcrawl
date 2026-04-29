@@ -860,6 +860,151 @@ func (s *Store) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
 
+// BackfillRow is a minimal row returned by MessageRowsForBackfill.
+type BackfillRow struct {
+	ID        int64
+	OrgID     int64
+	StreamID  int64
+	TopicID   int64
+	Timestamp string
+	Content   string // raw rendered HTML
+}
+
+// MessageRowsForBackfill streams a batch of message rows starting after
+// afterID up to maxID inclusive (for snapshot-bounded pagination). It returns
+// at most batchSize rows, ordered by id ascending. The caller should call this
+// repeatedly with the last returned ID as afterID until an empty slice is
+// returned.
+func (s *Store) MessageRowsForBackfill(ctx context.Context, afterID, maxID int64, batchSize int) ([]BackfillRow, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, org_id, stream_id, topic_id, timestamp, content
+FROM messages
+WHERE id > ? AND id <= ?
+ORDER BY id ASC
+LIMIT ?`, afterID, maxID, batchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []BackfillRow
+	for rows.Next() {
+		var r BackfillRow
+		if err := rows.Scan(&r.ID, &r.OrgID, &r.StreamID, &r.TopicID, &r.Timestamp, &r.Content); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// UpsertDerivedIndexesWithFTS replaces the mention/attachment rows for a set of
+// messages and updates messages_fts attachment_text for those rows. It is
+// idempotent: the DELETE + INSERT pattern ensures running twice leaves the same
+// result. All changes for a batch land in a single transaction.
+//
+// indexer is called per-message to produce the derived Mention/Attachment
+// slices from the rendered HTML. Passing it as a callback keeps the store
+// import-free from the syncer/indexing package (avoids a circular dep).
+func (s *Store) UpsertDerivedIndexesWithFTS(ctx context.Context, rows []BackfillRow, indexer func(r BackfillRow) ([]Mention, []Attachment)) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	for _, r := range rows {
+		mentions, attachments := indexer(r)
+
+		// Replace existing derived rows for this message.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM message_mentions WHERE message_id = ?`, r.ID); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("delete mentions for message %d: %w", r.ID, err)
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM message_attachments WHERE message_id = ?`, r.ID); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("delete attachments for message %d: %w", r.ID, err)
+		}
+
+		for _, m := range mentions {
+			if m.Kind == "" {
+				m.Kind = "user"
+			}
+			if m.Timestamp == "" {
+				m.Timestamp = r.Timestamp
+			}
+			if _, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO message_mentions(
+	message_id, org_id, stream_id, topic_id, mentioned_user_id, mentioned_name, mention_kind, timestamp
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				r.ID, r.OrgID, r.StreamID, r.TopicID, nullInt64IfZero(m.UserID), m.Name, m.Kind, m.Timestamp,
+			); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("insert mention for message %d: %w", r.ID, err)
+			}
+		}
+
+		for _, a := range attachments {
+			if a.Timestamp == "" {
+				a.Timestamp = r.Timestamp
+			}
+			if _, err := tx.ExecContext(ctx, `
+INSERT OR IGNORE INTO message_attachments(
+	message_id, org_id, stream_id, topic_id, url, file_name, title, content_type, text_content, indexed, timestamp
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				r.ID, r.OrgID, r.StreamID, r.TopicID, a.URL, a.FileName, a.Title,
+				a.ContentType, nullIfEmpty(a.Text), boolToInt(a.Indexed), a.Timestamp,
+			); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("insert attachment for message %d: %w", r.ID, err)
+			}
+		}
+
+		// Refresh FTS reading content_text from the stored row.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM messages_fts WHERE rowid = ?`, r.ID); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("delete fts for message %d: %w", r.ID, err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+INSERT INTO messages_fts(rowid, content_text, topic_name, sender_name, attachment_text)
+SELECT m.id, m.content_text,
+  COALESCE(t.name, ''),
+  COALESCE(u.full_name, ''),
+  COALESCE((SELECT group_concat(a.text_content, ' ')
+            FROM message_attachments a
+            WHERE a.message_id = m.id AND a.indexed = 1), '')
+FROM messages m
+LEFT JOIN topics t ON t.id = m.topic_id
+LEFT JOIN users u ON u.id = m.sender_id
+WHERE m.id = ?`, r.ID,
+		); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("reinsert fts for message %d: %w", r.ID, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// MaxMessageID returns the highest message id currently in the archive. It is
+// used to bound long-running backfills to a stable initial snapshot.
+func (s *Store) MaxMessageID(ctx context.Context) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM messages`).Scan(&id)
+	return id, err
+}
+
+// CountMessages returns the total number of rows in the messages table.
+func (s *Store) CountMessages(ctx context.Context) (int64, error) {
+	return s.CountMessagesThroughID(ctx, 1<<63-1)
+}
+
+// CountMessagesThroughID returns the number of messages at or below maxID.
+func (s *Store) CountMessagesThroughID(ctx context.Context, maxID int64) (int64, error) {
+	var n int64
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE id <= ?`, maxID).Scan(&n)
+	return n, err
+}
+
 func (s *Store) EnsureSystemUser(ctx context.Context, orgID int64, id int64, name string) error {
 	if id == 0 {
 		return nil
