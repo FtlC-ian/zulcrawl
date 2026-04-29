@@ -195,9 +195,11 @@ END;
 		return err
 	}
 	if ftsMigrated {
-		return s.ReindexFTS(ctx)
+		if err := s.ReindexFTS(ctx); err != nil {
+			return err
+		}
 	}
-	return nil
+	return s.InitEmbeddingSchema(ctx)
 }
 
 func (s *Store) prepareFTSMigration(ctx context.Context) (bool, error) {
@@ -318,6 +320,17 @@ ON CONFLICT(id) DO UPDATE SET
 func topicResolved(name string) bool {
 	t := strings.TrimSpace(name)
 	return strings.HasPrefix(t, "✔") || strings.HasPrefix(strings.ToLower(t), "[resolved]")
+}
+
+// SetTopicResolved updates the resolved flag for a single topic by ID.
+// Primarily used in tests; also available for manual resolution overrides.
+func (s *Store) SetTopicResolved(ctx context.Context, topicID int64, resolved bool) error {
+	v := 0
+	if resolved {
+		v = 1
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE topics SET resolved=? WHERE id=?`, v, topicID)
+	return err
 }
 
 func (s *Store) GetOrCreateTopic(ctx context.Context, orgID, streamID int64, name string) (int64, error) {
