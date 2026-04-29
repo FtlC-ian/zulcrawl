@@ -323,3 +323,38 @@ func TestQueryMessages_DevStream(t *testing.T) {
 
 // Verify that the os package import is not needed beyond tempdir.
 var _ = os.DevNull
+
+func TestQueryMessages_SenderEscapesLikeWildcards(t *testing.T) {
+	st := openTestStore(t)
+	defer st.Close()
+	seedDB(t, st)
+
+	ctx := context.Background()
+	if err := st.UpsertUser(ctx, store.User{ID: 12, OrgID: 1, FullName: "A_lice"}); err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := st.GetOrCreateTopic(ctx, 1, 1, "deploys")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertMessage(ctx, store.Message{
+		ID:          4001,
+		OrgID:       1,
+		StreamID:    1,
+		TopicID:     topicID,
+		SenderID:    12,
+		Content:     "literal underscore sender",
+		ContentText: "literal underscore sender",
+		Timestamp:   time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := st.QueryMessages(ctx, store.MessagesFilter{Sender: "A_", Limit: 200})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].SenderName != "A_lice" {
+		t.Fatalf("expected only literal underscore sender, got %#v", rows)
+	}
+}

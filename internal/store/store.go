@@ -563,6 +563,13 @@ type MessagesFilter struct {
 	Limit int
 }
 
+func escapeLike(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `%`, `\%`)
+	s = strings.ReplaceAll(s, `_`, `\_`)
+	return s
+}
+
 // QueryMessages returns messages matching f, always ordered oldest-first.
 func (s *Store) QueryMessages(ctx context.Context, f MessagesFilter) ([]MessageRow, error) {
 	// Determine the effective limit.
@@ -591,8 +598,8 @@ WHERE 1=1`
 		args = append(args, f.Topic)
 	}
 	if f.Sender != "" {
-		q += " AND u.full_name LIKE ?"
-		args = append(args, "%"+f.Sender+"%")
+		q += ` AND u.full_name LIKE ? ESCAPE '\'`
+		args = append(args, "%"+escapeLike(f.Sender)+"%")
 	}
 	if f.Since != "" {
 		q += " AND m.timestamp >= ?"
@@ -604,8 +611,8 @@ WHERE 1=1`
 	}
 	if f.Days > 0 || f.Hours > 0 {
 		window := time.Now().UTC().
-			Add(-time.Duration(f.Days)*24*time.Hour).
-			Add(-time.Duration(f.Hours)*time.Hour).
+			Add(-time.Duration(f.Days) * 24 * time.Hour).
+			Add(-time.Duration(f.Hours) * time.Hour).
 			Format(time.RFC3339)
 		q += " AND m.timestamp >= ?"
 		args = append(args, window)
