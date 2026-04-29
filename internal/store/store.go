@@ -31,6 +31,10 @@ func Open(path string) (*Store, error) {
 func (s *Store) Close() error { return s.db.Close() }
 
 func (s *Store) InitSchema(ctx context.Context) error {
+	ftsMigrated, err := s.prepareFTSMigration(ctx)
+	if err != nil {
+		return err
+	}
 	schema := `
 CREATE TABLE IF NOT EXISTS organizations (
     id INTEGER PRIMARY KEY,
@@ -86,6 +90,33 @@ CREATE TABLE IF NOT EXISTS messages (
     reactions TEXT,
     is_me_message INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS message_mentions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
+    stream_id INTEGER NOT NULL REFERENCES streams(id),
+    topic_id INTEGER NOT NULL REFERENCES topics(id),
+    mentioned_user_id INTEGER,
+    mentioned_name TEXT NOT NULL,
+    mention_kind TEXT NOT NULL DEFAULT 'user',
+    timestamp TEXT NOT NULL,
+    UNIQUE(message_id, mentioned_user_id, mentioned_name, mention_kind)
+);
+CREATE TABLE IF NOT EXISTS message_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
+    stream_id INTEGER NOT NULL REFERENCES streams(id),
+    topic_id INTEGER NOT NULL REFERENCES topics(id),
+    url TEXT NOT NULL,
+    file_name TEXT,
+    title TEXT,
+    content_type TEXT,
+    text_content TEXT,
+    indexed INTEGER DEFAULT 0,
+    timestamp TEXT NOT NULL,
+    UNIQUE(message_id, url)
+);
 
 -- Standalone FTS5 tables (no content= option).
 -- content= was intentionally removed because messages_fts declares extra columns
@@ -98,6 +129,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     content_text,
     topic_name,
     sender_name,
+    attachment_text,
     tokenize='porter unicode61'
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS topics_fts USING fts5(
@@ -116,24 +148,34 @@ CREATE TABLE IF NOT EXISTS sync_state (
 CREATE INDEX IF NOT EXISTS idx_messages_stream_topic ON messages(stream_id, topic_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
+CREATE INDEX IF NOT EXISTS idx_mentions_message ON message_mentions(message_id);
+CREATE INDEX IF NOT EXISTS idx_mentions_user ON message_mentions(mentioned_user_id);
+CREATE INDEX IF NOT EXISTS idx_mentions_name ON message_mentions(mentioned_name);
+CREATE INDEX IF NOT EXISTS idx_mentions_stream_topic ON message_mentions(stream_id, topic_id);
+CREATE INDEX IF NOT EXISTS idx_mentions_timestamp ON message_mentions(timestamp);
+CREATE INDEX IF NOT EXISTS idx_attachments_message ON message_attachments(message_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_stream_topic ON message_attachments(stream_id, topic_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_timestamp ON message_attachments(timestamp);
 CREATE INDEX IF NOT EXISTS idx_topics_stream ON topics(stream_id);
 CREATE INDEX IF NOT EXISTS idx_topics_resolved ON topics(resolved);
 
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-  INSERT INTO messages_fts(rowid, content_text, topic_name, sender_name)
+  INSERT INTO messages_fts(rowid, content_text, topic_name, sender_name, attachment_text)
   VALUES (new.id, new.content_text,
     COALESCE((SELECT name FROM topics WHERE id = new.topic_id),''),
-    COALESCE((SELECT full_name FROM users WHERE id = new.sender_id),''));
+    COALESCE((SELECT full_name FROM users WHERE id = new.sender_id),''),
+    COALESCE((SELECT group_concat(text_content, ' ') FROM message_attachments WHERE message_id = new.id AND indexed = 1),''));
 END;
 CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
   DELETE FROM messages_fts WHERE rowid = old.id;
 END;
 CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
   DELETE FROM messages_fts WHERE rowid = old.id;
-  INSERT INTO messages_fts(rowid, content_text, topic_name, sender_name)
+  INSERT INTO messages_fts(rowid, content_text, topic_name, sender_name, attachment_text)
   VALUES (new.id, new.content_text,
     COALESCE((SELECT name FROM topics WHERE id = new.topic_id),''),
-    COALESCE((SELECT full_name FROM users WHERE id = new.sender_id),''));
+    COALESCE((SELECT full_name FROM users WHERE id = new.sender_id),''),
+    COALESCE((SELECT group_concat(text_content, ' ') FROM message_attachments WHERE message_id = new.id AND indexed = 1),''));
 END;
 
 CREATE TRIGGER IF NOT EXISTS topics_ai AFTER INSERT ON topics BEGIN
@@ -147,8 +189,58 @@ CREATE TRIGGER IF NOT EXISTS topics_au AFTER UPDATE ON topics BEGIN
   INSERT INTO topics_fts(rowid, name) VALUES(new.id, new.name);
 END;
 `
-	_, err := s.db.ExecContext(ctx, schema)
-	return err
+	if _, err := s.db.ExecContext(ctx, schema); err != nil {
+		return err
+	}
+	if ftsMigrated {
+		return s.ReindexFTS(ctx)
+	}
+	return nil
+}
+
+func (s *Store) prepareFTSMigration(ctx context.Context) (bool, error) {
+	if _, err := s.db.ExecContext(ctx, `
+DROP TRIGGER IF EXISTS messages_ai;
+DROP TRIGGER IF EXISTS messages_ad;
+DROP TRIGGER IF EXISTS messages_au;
+`); err != nil {
+		return false, err
+	}
+	var name string
+	if err := s.db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name='messages_fts'`).Scan(&name); err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(messages_fts)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	hasAttachmentText := false
+	for rows.Next() {
+		var cid int
+		var colName, typ string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &colName, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if colName == "attachment_text" {
+			hasAttachmentText = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if hasAttachmentText {
+		return false, nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DROP TABLE messages_fts`); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
@@ -227,6 +319,31 @@ synced_at=excluded.synced_at
 	return id, nil
 }
 
+type Mention struct {
+	MessageID int64
+	OrgID     int64
+	StreamID  int64
+	TopicID   int64
+	UserID    int64
+	Name      string
+	Kind      string
+	Timestamp string
+}
+
+type Attachment struct {
+	MessageID   int64
+	OrgID       int64
+	StreamID    int64
+	TopicID     int64
+	URL         string
+	FileName    string
+	Title       string
+	ContentType string
+	Text        string
+	Indexed     bool
+	Timestamp   string
+}
+
 type Message struct {
 	ID            int64
 	OrgID         int64
@@ -242,10 +359,20 @@ type Message struct {
 	HasLink       bool
 	Reactions     json.RawMessage
 	IsMeMessage   bool
+	Mentions      []Mention
+	Attachments   []Attachment
 }
 
 func (s *Store) UpsertMessage(ctx context.Context, m Message) error {
-	return s.upsertMessageTx(ctx, s.db, m)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	if err := s.upsertMessageTx(ctx, tx, m); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
 }
 
 // upsertMessageTx is the shared implementation used by both UpsertMessage and
@@ -259,6 +386,12 @@ func (s *Store) upsertMessageTx(ctx context.Context, ex execer, m Message) error
 	reactions := string(m.Reactions)
 	if reactions == "" {
 		reactions = "[]"
+	}
+	if _, err := ex.ExecContext(ctx, `DELETE FROM message_mentions WHERE message_id = ?`, m.ID); err != nil {
+		return err
+	}
+	if _, err := ex.ExecContext(ctx, `DELETE FROM message_attachments WHERE message_id = ?`, m.ID); err != nil {
+		return err
 	}
 	_, err := ex.ExecContext(ctx, `
 INSERT INTO messages(
@@ -283,6 +416,51 @@ is_me_message=excluded.is_me_message
 		m.Content, m.ContentText, m.Timestamp, nullIfEmpty(m.EditTimestamp),
 		boolToInt(m.HasAttachment), boolToInt(m.HasImage), boolToInt(m.HasLink), reactions, boolToInt(m.IsMeMessage),
 	)
+	if err != nil {
+		return err
+	}
+	for _, mention := range m.Mentions {
+		if mention.Kind == "" {
+			mention.Kind = "user"
+		}
+		if mention.Timestamp == "" {
+			mention.Timestamp = m.Timestamp
+		}
+		if _, err := ex.ExecContext(ctx, `
+INSERT OR IGNORE INTO message_mentions(
+message_id, org_id, stream_id, topic_id, mentioned_user_id, mentioned_name, mention_kind, timestamp
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			m.ID, m.OrgID, m.StreamID, m.TopicID, nullInt64IfZero(mention.UserID), mention.Name, mention.Kind, mention.Timestamp,
+		); err != nil {
+			return err
+		}
+	}
+	for _, attachment := range m.Attachments {
+		if attachment.Timestamp == "" {
+			attachment.Timestamp = m.Timestamp
+		}
+		if _, err := ex.ExecContext(ctx, `
+INSERT OR IGNORE INTO message_attachments(
+message_id, org_id, stream_id, topic_id, url, file_name, title, content_type, text_content, indexed, timestamp
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			m.ID, m.OrgID, m.StreamID, m.TopicID, attachment.URL, attachment.FileName, attachment.Title,
+			attachment.ContentType, nullIfEmpty(attachment.Text), boolToInt(attachment.Indexed), attachment.Timestamp,
+		); err != nil {
+			return err
+		}
+	}
+	if len(m.Attachments) > 0 {
+		if _, err := ex.ExecContext(ctx, `DELETE FROM messages_fts WHERE rowid = ?`, m.ID); err != nil {
+			return err
+		}
+		_, err = ex.ExecContext(ctx, `
+INSERT INTO messages_fts(rowid, content_text, topic_name, sender_name, attachment_text)
+VALUES (?, ?,
+  COALESCE((SELECT name FROM topics WHERE id = ?),''),
+  COALESCE((SELECT full_name FROM users WHERE id = ?),''),
+  COALESCE((SELECT group_concat(text_content, ' ') FROM message_attachments WHERE message_id = ? AND indexed = 1),''));`,
+			m.ID, m.ContentText, m.TopicID, m.SenderID, m.ID)
+	}
 	return err
 }
 
@@ -490,6 +668,13 @@ func nullIfEmpty(s string) any {
 	return s
 }
 
+func nullInt64IfZero(n int64) any {
+	if n == 0 {
+		return nil
+	}
+	return n
+}
+
 func boolToInt(v bool) int {
 	if v {
 		return 1
@@ -510,10 +695,13 @@ func (s *Store) ReindexFTS(ctx context.Context) error {
 		`DELETE FROM messages_fts`,
 		`DELETE FROM topics_fts`,
 		// Repopulate messages_fts.
-		`INSERT INTO messages_fts(rowid, content_text, topic_name, sender_name)
+		`INSERT INTO messages_fts(rowid, content_text, topic_name, sender_name, attachment_text)
          SELECT m.id, m.content_text,
                 COALESCE(t.name, ''),
-                COALESCE(u.full_name, '')
+                COALESCE(u.full_name, ''),
+                COALESCE((SELECT group_concat(a.text_content, ' ')
+                          FROM message_attachments a
+                          WHERE a.message_id = m.id AND a.indexed = 1), '')
          FROM messages m
          LEFT JOIN topics t ON t.id = m.topic_id
          LEFT JOIN users u ON u.id = m.sender_id`,

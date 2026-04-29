@@ -237,11 +237,12 @@ func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) 
 				editTS = time.Unix(m.EditTimestamp, 0).UTC().Format(time.RFC3339)
 			}
 			contentText := htmlToText(m.Content)
+			mentions, attachments := parseMessageIndexables(m.ID, s.orgID, st.StreamID, topicID, ts, m.Content)
 			hasLink := strings.Contains(strings.ToLower(m.Content), "href=") ||
 				strings.Contains(contentText, "http://") ||
 				strings.Contains(contentText, "https://")
 			hasImage := strings.Contains(strings.ToLower(m.Content), "<img")
-			hasAttachment := strings.Contains(strings.ToLower(m.Content), "class=\"message_inline_ref\"")
+			hasAttachment := len(attachments) > 0 || strings.Contains(strings.ToLower(m.Content), "class=\"message_inline_ref\"")
 
 			batch = append(batch, store.Message{
 				ID:            m.ID,
@@ -257,6 +258,8 @@ func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) 
 				HasImage:      hasImage,
 				HasLink:       hasLink,
 				Reactions:     json.RawMessage(m.Reactions),
+				Mentions:      mentions,
+				Attachments:   attachments,
 				// m.IsMe reflects the API's is_me_message boolean (/me action
 				// messages).  m.Type=="private" means a direct message, which
 				// is a separate concept and should not reach the stream syncer.
@@ -370,11 +373,12 @@ func (s *Syncer) syncPrivateMessages(ctx context.Context, opts Options) error {
 				editTS = time.Unix(m.EditTimestamp, 0).UTC().Format(time.RFC3339)
 			}
 			contentText := htmlToText(m.Content)
+			mentions, attachments := parseMessageIndexables(m.ID, s.orgID, privateStreamID, topicID, ts, m.Content)
 			hasLink := strings.Contains(strings.ToLower(m.Content), "href=") ||
 				strings.Contains(contentText, "http://") ||
 				strings.Contains(contentText, "https://")
 			hasImage := strings.Contains(strings.ToLower(m.Content), "<img")
-			hasAttachment := strings.Contains(strings.ToLower(m.Content), "class=\"message_inline_ref\"")
+			hasAttachment := len(attachments) > 0 || strings.Contains(strings.ToLower(m.Content), "class=\"message_inline_ref\"")
 
 			batch = append(batch, store.Message{
 				ID:            m.ID,
@@ -391,6 +395,8 @@ func (s *Syncer) syncPrivateMessages(ctx context.Context, opts Options) error {
 				HasLink:       hasLink,
 				Reactions:     json.RawMessage(m.Reactions),
 				IsMeMessage:   m.IsMe,
+				Mentions:      mentions,
+				Attachments:   attachments,
 			})
 			if m.ID > maxID {
 				maxID = m.ID
