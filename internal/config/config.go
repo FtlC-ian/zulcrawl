@@ -151,6 +151,21 @@ func (c *Config) DBPath() string {
 	return ExpandPath(c.Database.Path)
 }
 
+func (c *Config) ValidateEmbeddings() error {
+	if !c.Embeddings.Enabled {
+		return nil
+	}
+	provider := strings.ToLower(strings.TrimSpace(c.Embeddings.Provider))
+	if provider == "" {
+		provider = "ollama"
+		c.Embeddings.Provider = provider
+	}
+	if provider != "ollama" {
+		return fmt.Errorf("embeddings.provider %q is not supported (only \"ollama\" is supported)", c.Embeddings.Provider)
+	}
+	return nil
+}
+
 func (c *Config) ValidateAuth() error {
 	if c.Zulip.URL == "" {
 		return errors.New("zulip.url is missing (config or ZULIP_URL)")

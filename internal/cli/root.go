@@ -334,11 +334,14 @@ FTS-only behaviour is the default and remains unchanged.`,
 			if semantic {
 				if !cfg.Embeddings.Enabled {
 					return fmt.Errorf(
-						"semantic search requires embeddings to be enabled.\n" +
-							"Set [embeddings] enabled = true in config, then run:\n" +
-							"  ollama pull %s\n" +
+						"semantic search requires embeddings to be enabled.\n"+
+							"Set [embeddings] enabled = true in config, then run:\n"+
+							"  ollama pull %s\n"+
 							"  zulcrawl embeddings backfill",
 						cfg.Embeddings.Model)
+				}
+				if err := cfg.ValidateEmbeddings(); err != nil {
+					return err
 				}
 				client := embed.NewOllamaClient(
 					cfg.Embeddings.OllamaBase,
@@ -764,10 +767,13 @@ Progress is printed as batches complete.`,
 			}
 			if !cfg.Embeddings.Enabled {
 				return fmt.Errorf(
-					"embeddings are disabled.\n" +
-						"Set [embeddings] enabled = true in config, then:\n" +
+					"embeddings are disabled.\n"+
+						"Set [embeddings] enabled = true in config, then:\n"+
 						"  ollama pull %s",
 					cfg.Embeddings.Model)
+			}
+			if err := cfg.ValidateEmbeddings(); err != nil {
+				return err
 			}
 
 			lockPath := cfg.DBPath() + ".lock"
@@ -837,6 +843,9 @@ func embeddingsStatusCmd(loadCfg func() (*config.Config, error)) *cobra.Command 
 			if !cfg.Embeddings.Enabled {
 				fmt.Println("embeddings: disabled (set [embeddings] enabled = true to activate)")
 				return nil
+			}
+			if err := cfg.ValidateEmbeddings(); err != nil {
+				return err
 			}
 			st, err := store.Open(cfg.DBPath())
 			if err != nil {
