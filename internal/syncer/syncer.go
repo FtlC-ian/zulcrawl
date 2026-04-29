@@ -61,10 +61,20 @@ func (s *Syncer) Sync(ctx context.Context, opts Options) error {
 	}
 
 	selected := filterStreams(streams, s.cfg.Sync.Streams, s.cfg.Sync.ExcludeStreams, opts.Streams)
-	if len(selected) == 0 {
-		return fmt.Errorf("no streams selected")
+	if len(selected) > 0 {
+		if err := s.syncStreams(ctx, selected, opts); err != nil {
+			return err
+		}
 	}
 
+	if err := s.syncPrivateMessages(ctx, opts); err != nil {
+		return fmt.Errorf("private messages: %w", err)
+	}
+
+	return nil
+}
+
+func (s *Syncer) syncStreams(ctx context.Context, selected []zulip.Stream, opts Options) error {
 	workers := s.cfg.Sync.Concurrency
 	if workers <= 0 {
 		workers = 4
@@ -94,6 +104,9 @@ func (s *Syncer) Sync(ctx context.Context, opts Options) error {
 			InviteOnly:  st.InviteOnly,
 			IsWebPublic: st.IsWebPublic,
 		}); err != nil {
+			close(ch)
+			wg.Wait()
+			close(errCh)
 			return err
 		}
 		// Respect context cancellation while distributing work.
@@ -115,11 +128,6 @@ func (s *Syncer) Sync(ctx context.Context, opts Options) error {
 			return err
 		}
 	}
-
-	if err := s.syncPrivateMessages(ctx, opts); err != nil {
-		return fmt.Errorf("private messages: %w", err)
-	}
-
 	return nil
 }
 
