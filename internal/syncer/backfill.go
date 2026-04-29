@@ -35,7 +35,11 @@ func BackfillIndexes(ctx context.Context, st *store.Store, opts BackfillOptions,
 		batchSize = defaultBackfillBatch
 	}
 
-	total, err := st.CountMessages(ctx)
+	maxID, err := st.MaxMessageID(ctx)
+	if err != nil {
+		return fmt.Errorf("backfill: find max message id: %w", err)
+	}
+	total, err := st.CountMessagesThroughID(ctx, maxID)
 	if err != nil {
 		return fmt.Errorf("backfill: count messages: %w", err)
 	}
@@ -44,7 +48,7 @@ func BackfillIndexes(ctx context.Context, st *store.Store, opts BackfillOptions,
 		return nil
 	}
 
-	_, _ = fmt.Fprintf(w, "backfill-indexes: %d messages to process (batch=%d)\n", total, batchSize)
+	_, _ = fmt.Fprintf(w, "backfill-indexes: %d messages to process through id=%d (batch=%d)\n", total, maxID, batchSize)
 	start := time.Now()
 
 	indexer := func(r store.BackfillRow) ([]store.Mention, []store.Attachment) {
@@ -54,7 +58,7 @@ func BackfillIndexes(ctx context.Context, st *store.Store, opts BackfillOptions,
 	var processed int64
 	var afterID int64
 	for {
-		batch, err := st.MessageRowsForBackfill(ctx, afterID, batchSize)
+		batch, err := st.MessageRowsForBackfill(ctx, afterID, maxID, batchSize)
 		if err != nil {
 			return fmt.Errorf("backfill: fetch batch after id=%d: %w", afterID, err)
 		}

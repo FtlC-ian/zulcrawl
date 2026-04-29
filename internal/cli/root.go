@@ -485,6 +485,9 @@ Useful after a schema migration that introduced these tables when the archive
 already contained messages. Runs in batches (default 200 per transaction) and
 prints progress to stderr. Idempotent: running twice leaves the same result.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if batchSize <= 0 {
+				return fmt.Errorf("--batch must be positive")
+			}
 			cfg, err := loadCfg()
 			if err != nil {
 				return err

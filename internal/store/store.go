@@ -862,25 +862,26 @@ func (s *Store) Ping(ctx context.Context) error {
 
 // BackfillRow is a minimal row returned by MessageRowsForBackfill.
 type BackfillRow struct {
-	ID          int64
-	OrgID       int64
-	StreamID    int64
-	TopicID     int64
-	Timestamp   string
-	Content     string // raw rendered HTML
+	ID        int64
+	OrgID     int64
+	StreamID  int64
+	TopicID   int64
+	Timestamp string
+	Content   string // raw rendered HTML
 }
 
 // MessageRowsForBackfill streams a batch of message rows starting after
-// afterID (for pagination). It returns at most batchSize rows, ordered by id
-// ascending. The caller should call this repeatedly with the last returned ID
-// as afterID until an empty slice is returned.
-func (s *Store) MessageRowsForBackfill(ctx context.Context, afterID int64, batchSize int) ([]BackfillRow, error) {
+// afterID up to maxID inclusive (for snapshot-bounded pagination). It returns
+// at most batchSize rows, ordered by id ascending. The caller should call this
+// repeatedly with the last returned ID as afterID until an empty slice is
+// returned.
+func (s *Store) MessageRowsForBackfill(ctx context.Context, afterID, maxID int64, batchSize int) ([]BackfillRow, error) {
 	rows, err := s.db.QueryContext(ctx, `
 SELECT id, org_id, stream_id, topic_id, timestamp, content
 FROM messages
-WHERE id > ?
+WHERE id > ? AND id <= ?
 ORDER BY id ASC
-LIMIT ?`, afterID, batchSize)
+LIMIT ?`, afterID, maxID, batchSize)
 	if err != nil {
 		return nil, err
 	}
@@ -984,10 +985,23 @@ WHERE m.id = ?`, r.ID,
 	return tx.Commit()
 }
 
+// MaxMessageID returns the highest message id currently in the archive. It is
+// used to bound long-running backfills to a stable initial snapshot.
+func (s *Store) MaxMessageID(ctx context.Context) (int64, error) {
+	var id int64
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM messages`).Scan(&id)
+	return id, err
+}
+
 // CountMessages returns the total number of rows in the messages table.
 func (s *Store) CountMessages(ctx context.Context) (int64, error) {
+	return s.CountMessagesThroughID(ctx, 1<<63-1)
+}
+
+// CountMessagesThroughID returns the number of messages at or below maxID.
+func (s *Store) CountMessagesThroughID(ctx context.Context, maxID int64) (int64, error) {
 	var n int64
-	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages`).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE id <= ?`, maxID).Scan(&n)
 	return n, err
 }
 
