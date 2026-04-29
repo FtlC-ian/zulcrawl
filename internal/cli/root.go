@@ -502,6 +502,13 @@ prints progress to stderr. Idempotent: running twice leaves the same result.`,
 			if err != nil {
 				return err
 			}
+			lockPath := cfg.DBPath() + ".lock"
+			l, err := lock.Acquire(lockPath)
+			if err != nil {
+				return err
+			}
+			defer l.Release()
+
 			st, err := store.Open(cfg.DBPath())
 			if err != nil {
 				return err
