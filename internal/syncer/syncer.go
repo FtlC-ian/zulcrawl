@@ -208,8 +208,10 @@ func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) 
 		// not return bots, system users, or deactivated accounts, but every
 		// message carries sender_id + sender_full_name, so we can ensure the
 		// FK target exists before inserting the message.
+		// EnsureMessageSender preserves richer fields (email/avatar/is_bot)
+		// that were populated by the full roster sync.
 		for _, m := range resp.Messages {
-			if err := s.store.UpsertUser(ctx, store.User{
+			if err := s.store.EnsureMessageSender(ctx, store.User{
 				ID:       m.SenderID,
 				OrgID:    s.orgID,
 				FullName: m.SenderFullName,
@@ -347,7 +349,7 @@ func (s *Syncer) syncPrivateMessages(ctx context.Context, opts Options) error {
 		s.logger.log("private messages: page %d – %d messages (anchor=%s)", pageNum, len(resp.Messages), anchor)
 
 		for _, m := range resp.Messages {
-			if err := s.store.UpsertUser(ctx, store.User{
+			if err := s.store.EnsureMessageSender(ctx, store.User{
 				ID:       m.SenderID,
 				OrgID:    s.orgID,
 				FullName: m.SenderFullName,

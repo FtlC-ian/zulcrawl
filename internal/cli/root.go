@@ -148,6 +148,7 @@ func syncCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 	var full bool
 	var since string
 	var streams string
+	var quiet bool
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Sync streams/messages from Zulip",
@@ -159,6 +160,17 @@ func syncCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 			if err := cfg.ValidateAuth(); err != nil {
 				return err
 			}
+
+			// Acquire the exclusive lock immediately after auth validation and
+			// before any DB open / migration work, so two concurrent sync
+			// invocations cannot race on schema migration, reindex, or setup.
+			lockPath := cfg.DBPath() + ".lock"
+			l, err := lock.Acquire(lockPath)
+			if err != nil {
+				return err
+			}
+			defer l.Release()
+
 			ctx := cmd.Context()
 			st, err := store.Open(cfg.DBPath())
 			if err != nil {
@@ -169,17 +181,7 @@ func syncCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 				return err
 			}
 
-			// Acquire an exclusive lock so two concurrent sync processes do not
-			// write the same archive simultaneously.
-			lockPath := cfg.DBPath() + ".lock"
-			l, err := lock.Acquire(lockPath)
-			if err != nil {
-				return err
-			}
-			defer l.Release()
-
 			api := zulip.NewClient(cfg.Zulip.URL, cfg.Zulip.Email, cfg.Zulip.APIKey)
-			sy := syncer.New(cfg, api, st)
 			var include []string
 			if streams != "" {
 				for _, s := range strings.Split(streams, ",") {
@@ -196,6 +198,13 @@ func syncCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 				since = since + "T00:00:00Z"
 			}
 
+			var sy *syncer.Syncer
+			if quiet {
+				sy = syncer.NewWithLogger(cfg, api, st, nil)
+			} else {
+				sy = syncer.New(cfg, api, st)
+			}
+
 			start := time.Now()
 			if err := sy.Sync(ctx, syncer.Options{Full: full, Streams: include, Since: since}); err != nil {
 				return err
@@ -207,6 +216,7 @@ func syncCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 	cmd.Flags().BoolVar(&full, "full", false, "full backfill")
 	cmd.Flags().StringVar(&streams, "streams", "", "comma-separated stream names")
 	cmd.Flags().StringVar(&since, "since", "", "only include messages since date (YYYY-MM-DD)")
+	cmd.Flags().BoolVar(&quiet, "quiet", false, "suppress progress output (only print final summary or errors)")
 	return cmd
 }
 

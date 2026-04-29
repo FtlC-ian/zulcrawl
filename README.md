@@ -10,14 +10,29 @@
 - Cobra CLI commands:
   - `init`
   - `doctor`
-  - `sync --full --streams --since`
+  - `sync --full --streams --since [--quiet]`
   - `search`
   - `topics`
   - `stats`
   - `sql`
+  - `messages` — direct archive slice queries (see below)
+  - `backfill-indexes` — rebuild mention/attachment indexes for existing messages
 - Syncer with parallel stream workers and incremental sync (`sync_state`)
 - HTML-to-text conversion for indexing
 - Search ranking with FTS BM25, resolved-topic boost, and recency boost
+- Mention and attachment indexes parsed from rendered HTML
+
+## Attachment indexing — current scope
+
+Attachment indexing covers **text already present in the Zulip-rendered HTML** of
+each message — inline previews and short snippets that Zulip embeds in the
+rendered `<div class="message_inline_ref">` block.  It does **not** fetch or
+parse the actual uploaded file contents (PDFs, images, Office documents, etc.).
+For text-heavy attachments the best coverage comes from users quoting or
+summarising content in the message body itself.
+
+Full file-content extraction (downloading from `/user_uploads/…` and parsing
+the file bytes) is a planned future enhancement and is **not implemented**.
 
 ## Build
 
@@ -68,6 +83,9 @@ zulcrawl sync --streams general,engineering
 # Sync only messages from date onward (YYYY-MM-DD)
 zulcrawl sync --since 2026-01-01
 
+# Sync silently (suppress progress lines, show only final summary or errors)
+zulcrawl sync --quiet
+
 # Search
 zulcrawl search "database migration"
 zulcrawl search --stream engineering --resolved "deploy script"
@@ -81,6 +99,58 @@ zulcrawl stats
 
 # Raw SQL
 zulcrawl sql "SELECT stream_id, COUNT(*) FROM messages GROUP BY stream_id ORDER BY 2 DESC LIMIT 10"
+```
+
+## messages command
+
+`zulcrawl messages` queries the local archive without hitting the Zulip API.
+At least one narrowing filter is required to prevent accidental full-archive dumps.
+
+**Flags**
+
+| Flag | Description |
+|------|-------------|
+| `--stream NAME` | Filter by stream name (exact match) |
+| `--topic NAME` | Filter by topic name (exact match) |
+| `--sender NAME` | Filter by sender full name (substring match) |
+| `--since DATE` | Only messages at or after this time (RFC3339 or `YYYY-MM-DD`) |
+| `--until DATE` | Only messages at or before this time (RFC3339 or `YYYY-MM-DD`) |
+| `--days N` | Only messages from the last N days |
+| `--hours N` | Only messages from the last N hours |
+| `--last N` | Return the N most recent messages (oldest-first output) |
+| `--limit N` | Maximum messages to return (default 200) |
+| `--all` | Remove safety limit and return all matching messages |
+
+**Examples**
+
+```bash
+# Last 7 days in the #general stream
+zulcrawl messages --stream general --days 7
+
+# All messages in a specific topic
+zulcrawl messages --stream engineering --topic "Q2 roadmap"
+
+# Messages from a specific sender since a date
+zulcrawl messages --sender "Alice" --since 2026-01-01
+
+# Last 50 messages across the entire archive
+zulcrawl messages --last 50
+
+# Messages in the last 4 hours across all streams
+zulcrawl messages --hours 4
+
+# Combined: sender + date range, higher limit
+zulcrawl messages --stream dev --sender "Bob" --since 2026-03-01 --until 2026-03-31 --limit 500
+
+# Remove the safety cap entirely (use with care on large archives)
+zulcrawl messages --stream general --days 365 --all
+```
+
+Output format per message:
+```
+[YYYY-MM-DD HH:MM:SS] #stream > topic | Sender Name
+  message content text...
+
 ```
 
 ## Notes
