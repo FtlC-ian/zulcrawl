@@ -258,7 +258,7 @@ func topicsCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 	var limit int
 	cmd := &cobra.Command{
 		Use:   "topics",
-		Short: "List topics with stats",
+		Short: "List topics or search topics by content",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg, err := loadCfg()
 			if err != nil {
@@ -286,6 +286,73 @@ func topicsCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 	cmd.Flags().StringVar(&stream, "stream", "", "stream name")
 	cmd.Flags().BoolVar(&unresolved, "unresolved", false, "only unresolved topics")
 	cmd.Flags().IntVar(&limit, "limit", 100, "row limit")
+	cmd.AddCommand(topicsSearchCmd(loadCfg))
+	return cmd
+}
+
+func topicsSearchCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
+	var stream string
+	var unresolved bool
+	var limit int
+	cmd := &cobra.Command{
+		Use:   "search [query]",
+		Short: "Hybrid topic-level search (FTS on topic names + message content)",
+		Long: `Search topics by name and by the content of their messages.
+
+Results are ranked by:
+  - FTS relevance (BM25) on topic name and/or message text
+  - Activity bonus: more messages → slightly higher rank
+  - Recency: recently-active topics rank higher
+  - Resolved bonus: resolved topics get a small lift
+
+This is a purely local FTS/hybrid search. No remote embedding APIs are called.
+Embedding-provider integration is left for a future chunk (see issue #9).`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadCfg()
+			if err != nil {
+				return err
+			}
+			st, err := store.Open(cfg.DBPath())
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			hits, err := st.SearchTopics(cmd.Context(), store.TopicSearchOptions{
+				Query:          args[0],
+				Stream:         stream,
+				Limit:          limit,
+				OnlyUnresolved: unresolved,
+			})
+			if err != nil {
+				return err
+			}
+			if len(hits) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "No topics found.")
+				return nil
+			}
+			for _, h := range hits {
+				res := ""
+				if h.Resolved {
+					res = " [resolved]"
+				}
+				lastAt := h.LastMessageAt
+				if t, err2 := time.Parse(time.RFC3339, h.LastMessageAt); err2 == nil {
+					lastAt = t.Format("2006-01-02")
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "#%s > %s%s (%d msgs, last %s)\n",
+					h.StreamName, h.TopicName, res, h.MessageCount, lastAt)
+				if h.BestSnippet != "" {
+					fmt.Fprintf(cmd.OutOrStdout(), "  %s\n", h.BestSnippet)
+				}
+				fmt.Fprintln(cmd.OutOrStdout())
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&stream, "stream", "", "filter by stream name")
+	cmd.Flags().BoolVar(&unresolved, "unresolved", false, "only unresolved topics")
+	cmd.Flags().IntVar(&limit, "limit", 20, "max topics to return")
 	return cmd
 }
 

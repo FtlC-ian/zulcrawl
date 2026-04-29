@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 	"time"
 
@@ -600,6 +602,226 @@ type SearchHit struct {
 	SenderName string
 	Snippet    string
 	Rank       float64
+}
+
+// TopicSearchHit is a single result from a topic-level search.
+type TopicSearchHit struct {
+	TopicID      int64
+	StreamName   string
+	TopicName    string
+	Resolved     bool
+	MessageCount int64
+	LastMessageAt  string
+	FirstMessageAt string
+	// BestSnippet is a representative snippet from the best-matching message.
+	BestSnippet string
+	// Rank is the combined relevance score (higher = better).
+	Rank float64
+}
+
+// TopicSearchOptions controls the topic-level search.
+type TopicSearchOptions struct {
+	Query  string
+	Stream string
+	Limit  int
+	// OnlyUnresolved excludes resolved topics.
+	OnlyUnresolved bool
+}
+
+// SearchTopics performs a hybrid topic-level search.
+//
+// It runs two legs:
+//  1. FTS on topic names (topics_fts) — catches topics whose title contains
+//     the query terms.
+//  2. FTS on message content (messages_fts) grouped by topic — catches topics
+//     discussed in messages matching the query.
+//
+// Results from both legs are merged and de-duplicated by topic ID, then ranked
+// by: BM25 relevance + log2(message_count) activity bonus + recency decay +
+// resolved bonus (+0.15).
+//
+// No remote embedding APIs are called. This is a purely local hybrid/FTS
+// approach; a pluggable vector-embedding layer is left for a future chunk.
+func (s *Store) SearchTopics(ctx context.Context, opts TopicSearchOptions) ([]TopicSearchHit, error) {
+	if opts.Limit <= 0 {
+		opts.Limit = 20
+	}
+	if opts.Query == "" {
+		return nil, fmt.Errorf("query must not be empty")
+	}
+
+	// map from topicID → working result
+	type entry struct {
+		TopicSearchHit
+		nameScore    float64
+		contentScore float64
+	}
+	seen := map[int64]*entry{}
+
+	// ── Leg 1: topic-name FTS ────────────────────────────────────────────────
+	// Search topics_fts for name matches. We fetch raw bm25 (negated) and
+	// join topic metadata. We pull up to 4× the limit to have headroom after
+	// merge.
+	nameQ := `
+SELECT t.id, st.name, t.name, t.resolved, t.message_count,
+       COALESCE(t.last_message_at,''), COALESCE(t.first_message_at,''),
+       -bm25(topics_fts) AS bm25_score
+FROM topics_fts
+JOIN topics t ON t.id = topics_fts.rowid
+JOIN streams st ON st.id = t.stream_id
+WHERE topics_fts MATCH ?`
+	nameArgs := []any{opts.Query}
+	if opts.Stream != "" {
+		nameQ += " AND st.name = ?"
+		nameArgs = append(nameArgs, opts.Stream)
+	}
+	if opts.OnlyUnresolved {
+		nameQ += " AND t.resolved = 0"
+	}
+	nameQ += " ORDER BY bm25_score DESC LIMIT ?"
+	nameArgs = append(nameArgs, opts.Limit*4)
+
+	nameRows, err := s.db.QueryContext(ctx, nameQ, nameArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("topics_fts search: %w", err)
+	}
+	defer nameRows.Close()
+	for nameRows.Next() {
+		var e entry
+		var resolved int
+		if err := nameRows.Scan(
+			&e.TopicID, &e.StreamName, &e.TopicName,
+			&resolved, &e.MessageCount,
+			&e.LastMessageAt, &e.FirstMessageAt,
+			&e.nameScore,
+		); err != nil {
+			return nil, err
+		}
+		e.Resolved = resolved == 1
+		seen[e.TopicID] = &e
+	}
+	if err := nameRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// ── Leg 2: message-content FTS, grouped by topic ─────────────────────────
+	// bm25() is an FTS5 auxiliary function that can only be used in ORDER BY
+	// (or scalar position) of a direct FTS query — not inside MIN() / GROUP BY.
+	// We therefore fetch individual rows ordered by relevance and aggregate by
+	// topic in Go, keeping only the best score and first snippet per topic.
+	contentQ := `
+SELECT t.id, st.name, t.name, t.resolved, t.message_count,
+       COALESCE(t.last_message_at,''), COALESCE(t.first_message_at,''),
+       -bm25(messages_fts) AS bm25_score,
+       snippet(messages_fts, 0, '', '', ' … ', 20)
+FROM messages_fts
+JOIN messages m ON m.id = messages_fts.rowid
+JOIN topics t ON t.id = m.topic_id
+JOIN streams st ON st.id = m.stream_id
+WHERE messages_fts MATCH ?`
+	contentArgs := []any{opts.Query}
+	if opts.Stream != "" {
+		contentQ += " AND st.name = ?"
+		contentArgs = append(contentArgs, opts.Stream)
+	}
+	if opts.OnlyUnresolved {
+		contentQ += " AND t.resolved = 0"
+	}
+	contentQ += " ORDER BY bm25(messages_fts) LIMIT ?"
+	contentArgs = append(contentArgs, opts.Limit*8)
+
+	contentRows, err := s.db.QueryContext(ctx, contentQ, contentArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("messages_fts topic search: %w", err)
+	}
+	defer contentRows.Close()
+	for contentRows.Next() {
+		var topicID int64
+		var streamName, topicName, lastAt, firstAt, snippet string
+		var resolved int
+		var msgCount int64
+		var contentScore float64
+		if err := contentRows.Scan(
+			&topicID, &streamName, &topicName,
+			&resolved, &msgCount,
+			&lastAt, &firstAt,
+			&contentScore, &snippet,
+		); err != nil {
+			return nil, err
+		}
+		if existing, ok := seen[topicID]; ok {
+			// Keep the best (highest) content score seen for this topic.
+			if contentScore > existing.contentScore {
+				existing.contentScore = contentScore
+			}
+			// First snippet wins (rows are ordered best-first).
+			if existing.BestSnippet == "" && snippet != "" {
+				existing.BestSnippet = snippet
+			}
+		} else {
+			e := &entry{
+				TopicSearchHit: TopicSearchHit{
+					TopicID:        topicID,
+					StreamName:     streamName,
+					TopicName:      topicName,
+					Resolved:       resolved == 1,
+					MessageCount:   msgCount,
+					LastMessageAt:  lastAt,
+					FirstMessageAt: firstAt,
+					BestSnippet:    snippet,
+				},
+				contentScore: contentScore,
+			}
+			seen[topicID] = e
+		}
+	}
+	if err := contentRows.Err(); err != nil {
+		return nil, err
+	}
+
+	// ── Combine & rank ───────────────────────────────────────────────────────
+	// Final score formula:
+	//   max(nameScore, contentScore)
+	//   + 0.1 * log2(1 + message_count)   [activity bonus]
+	//   + recency_bonus(last_message_at)  [0..0.5, decaying over 90 days]
+	//   + 0.15 if resolved               [resolution bonus]
+	//
+	// BM25 scores from SQLite FTS5 are negative; we negate them so higher = better.
+	// The formula is intentionally simple and tunable — no embeddings are used.
+	out := make([]TopicSearchHit, 0, len(seen))
+	for _, e := range seen {
+		base := e.nameScore
+		if e.contentScore > base {
+			base = e.contentScore
+		}
+		// Activity bonus: log2(1+count) scaled so 100 msgs ≈ +0.7
+		activity := 0.0
+		if e.MessageCount > 0 {
+			activity = math.Log2(1+float64(e.MessageCount)) * 0.1
+		}
+		// Recency decay: 0.5 when today, approaches 0 after ~90 days
+		recency := 0.0
+		if e.LastMessageAt != "" {
+			if t, err2 := time.Parse(time.RFC3339, e.LastMessageAt); err2 == nil {
+				daysAgo := time.Since(t).Hours() / 24
+				recency = 0.5 / (1 + daysAgo/30)
+			}
+		}
+		// Resolved bonus
+		resolvedBonus := 0.0
+		if e.Resolved {
+			resolvedBonus = 0.15
+		}
+		e.Rank = base + activity + recency + resolvedBonus
+		out = append(out, e.TopicSearchHit)
+	}
+
+	// Sort by descending rank.
+	sort.Slice(out, func(i, j int) bool { return out[i].Rank > out[j].Rank })
+	if len(out) > opts.Limit {
+		out = out[:opts.Limit]
+	}
+	return out, nil
 }
 
 func (s *Store) Search(ctx context.Context, query, stream string, resolvedOnly bool, limit int) ([]SearchHit, error) {

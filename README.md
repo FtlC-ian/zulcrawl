@@ -12,7 +12,8 @@
   - `doctor`
   - `sync --full --streams --since [--quiet]`
   - `search`
-  - `topics`
+  - `topics` — list topics or topic-level hybrid search
+  - `topics search` — hybrid search: FTS on topic names + message content (see below)
   - `stats`
   - `sql`
   - `messages` — direct archive slice queries (see below)
@@ -20,6 +21,7 @@
 - Syncer with parallel stream workers and incremental sync (`sync_state`)
 - HTML-to-text conversion for indexing
 - Search ranking with FTS BM25, resolved-topic boost, and recency boost
+- Topic-level hybrid search: two-leg FTS (topic names + message content) with activity/recency scoring
 - Mention and attachment indexes parsed from rendered HTML
 
 ## Attachment indexing — current scope
@@ -94,11 +96,53 @@ zulcrawl search --stream engineering --resolved "deploy script"
 zulcrawl topics --stream engineering
 zulcrawl topics --unresolved
 
+# Topic-level hybrid search (FTS on topic names + message content)
+# Finds topics whose name or messages match the query
+zulcrawl topics search "database migration"
+zulcrawl topics search --stream engineering "deploy script"
+zulcrawl topics search --unresolved --limit 10 "onboarding"
+
 # Stats
 zulcrawl stats
 
 # Raw SQL
 zulcrawl sql "SELECT stream_id, COUNT(*) FROM messages GROUP BY stream_id ORDER BY 2 DESC LIMIT 10"
+```
+
+## topics search command
+
+`zulcrawl topics search <query>` performs a hybrid topic-level search over the
+local archive. It runs two legs:
+
+1. **Topic-name FTS** (`topics_fts`) — finds topics whose name matches the query.
+2. **Message-content FTS** (`messages_fts`) aggregated by topic — finds topics
+   that contain relevant messages.
+
+Results from both legs are merged and de-duplicated by topic ID, then scored:
+
+| Signal | Weight |
+|--------|--------|
+| BM25 relevance (best of name/message leg) | base |
+| Activity bonus: log₂(1 + message_count) × 0.1 | up to ~0.7 for large topics |
+| Recency decay: 0.5 / (1 + days_since_last_msg / 30) | 0–0.5 |
+| Resolved bonus | +0.15 |
+
+**No remote embedding APIs are called.** This is a local FTS/hybrid approach.
+Vector-embedding provider integration is deferred to a future chunk (issue #9).
+
+**Flags**
+
+| Flag | Description |
+|------|-------------|
+| `--stream NAME` | Filter by stream name |
+| `--unresolved` | Exclude resolved topics |
+| `--limit N` | Maximum topics to return (default 20) |
+
+**Output format**
+
+```
+#stream > topic name [resolved] (N msgs, last YYYY-MM-DD)
+  …best matching message snippet…
 ```
 
 ## messages command
@@ -157,4 +201,4 @@ Output format per message:
 
 - Uses `modernc.org/sqlite` (pure Go, no CGO)
 - Current implementation focuses on core mirror/search flow
-- Planned later (per spec): tail/event queue, MCP server, semantic search, summarization, Q&A extraction
+- Planned later (per spec): tail/event queue, MCP server, vector-embedding semantic search (pluggable provider, off by default), summarization, Q&A extraction
