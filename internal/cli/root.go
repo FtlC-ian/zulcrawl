@@ -38,6 +38,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(topicsCmd(loadCfg))
 	root.AddCommand(statsCmd(loadCfg))
 	root.AddCommand(sqlCmd(loadCfg))
+	root.AddCommand(messagesCmd(loadCfg))
 	return root
 }
 
@@ -345,6 +346,112 @@ func sqlCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 			return rows.Err()
 		},
 	}
+}
+
+func messagesCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
+	var stream, topic, sender, since, until string
+	var days, hours, last, limit int
+	var all bool
+
+	cmd := &cobra.Command{
+		Use:   "messages",
+		Short: "Query archived messages from the local SQLite DB",
+		Long: `Return an exact archive slice from the local SQLite database.
+
+At least one narrowing filter is required to avoid accidental full-archive
+dumps. Use --stream, --topic, --sender, --days, --hours, --since, or --until.
+The default safety limit is 200 messages; use --limit or --all to override.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadCfg()
+			if err != nil {
+				return err
+			}
+			st, err := store.Open(cfg.DBPath())
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+
+			// Require at least one narrowing filter.
+			if stream == "" && topic == "" && sender == "" &&
+				since == "" && until == "" && days == 0 && hours == 0 &&
+				last == 0 && !all {
+				return fmt.Errorf(
+					"at least one narrowing filter is required\n" +
+						"  e.g. --stream general --days 7\n" +
+						"  Use --all to fetch the entire archive (may be very large)")
+			}
+
+			// Validate --since / --until formats.
+			for flagName, val := range map[string]string{"since": since, "until": until} {
+				if val == "" {
+					continue
+				}
+				// Accept RFC3339 or YYYY-MM-DD.
+				if _, err := time.Parse(time.RFC3339, val); err != nil {
+					if _, err2 := time.Parse("2006-01-02", val); err2 != nil {
+						return fmt.Errorf("--%s must be RFC3339 (2006-01-02T15:04:05Z) or YYYY-MM-DD, got %q", flagName, val)
+					}
+					// Expand YYYY-MM-DD to start of day.
+					if flagName == "since" {
+						since = val + "T00:00:00Z"
+					} else {
+						until = val + "T23:59:59Z"
+					}
+				}
+			}
+
+			if all {
+				limit = 0 // 0 = no cap (store uses 0 to mean "no override")
+			}
+
+			f := store.MessagesFilter{
+				Stream: stream,
+				Topic:  topic,
+				Sender: sender,
+				Since:  since,
+				Until:  until,
+				Days:   days,
+				Hours:  hours,
+				Last:   last,
+				Limit:  limit,
+			}
+			if all {
+				f.Limit = -1 // signal to store: no cap
+			}
+
+			msgs, err := st.QueryMessages(cmd.Context(), f)
+			if err != nil {
+				return err
+			}
+			if len(msgs) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "No messages found.")
+				return nil
+			}
+			for _, m := range msgs {
+				timeText := m.Timestamp
+				if t, err2 := time.Parse(time.RFC3339, m.Timestamp); err2 == nil {
+					timeText = t.Format("2006-01-02 15:04:05")
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "[%s] #%s > %s | %s\n  %s\n\n",
+					timeText, m.StreamName, m.TopicName, m.SenderName, m.Content)
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "(%d messages)\n", len(msgs))
+			return nil
+		},
+	}
+
+	cmd.Flags().StringVar(&stream, "stream", "", "filter by stream name")
+	cmd.Flags().StringVar(&topic, "topic", "", "filter by topic name (exact match)")
+	cmd.Flags().StringVar(&sender, "sender", "", "filter by sender full name (substring match)")
+	cmd.Flags().StringVar(&since, "since", "", "only messages at or after this time (RFC3339 or YYYY-MM-DD)")
+	cmd.Flags().StringVar(&until, "until", "", "only messages at or before this time (RFC3339 or YYYY-MM-DD)")
+	cmd.Flags().IntVar(&days, "days", 0, "only messages from the last N days")
+	cmd.Flags().IntVar(&hours, "hours", 0, "only messages from the last N hours")
+	cmd.Flags().IntVar(&last, "last", 0, "return the N most recent messages (oldest-first output)")
+	cmd.Flags().IntVar(&limit, "limit", 200, "maximum messages to return (default 200)")
+	cmd.Flags().BoolVar(&all, "all", false, "remove safety limit and return all matching messages")
+	return cmd
 }
 
 func applyOpenClawConfig(path string, cfg *config.Config) error {

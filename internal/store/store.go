@@ -529,6 +529,138 @@ func (s *Store) ReindexFTS(ctx context.Context) error {
 	return tx.Commit()
 }
 
+// MessageRow is a single message returned by QueryMessages.
+type MessageRow struct {
+	ID         int64
+	StreamName string
+	TopicName  string
+	SenderName string
+	Timestamp  string
+	Content    string
+}
+
+// MessagesFilter specifies which messages to return. At least one narrowing
+// criterion must be set by the caller; the store itself does not enforce the
+// requirement — that is done in the CLI layer.
+type MessagesFilter struct {
+	Stream string // stream name (exact match)
+	Topic  string // topic name  (exact match)
+	Sender string // sender full_name LIKE search
+
+	// Time window — RFC3339 timestamps, both optional.
+	Since string
+	Until string
+
+	// Convenience windows — applied as "now - duration".
+	// Days and Hours are cumulative (whichever is non-zero is added).
+	Days  int
+	Hours int
+
+	// Last N (sorted DESC inside, reversed before return).
+	Last int
+
+	// Hard cap; 0 means use default.
+	Limit int
+}
+
+// QueryMessages returns messages matching f, always ordered oldest-first.
+func (s *Store) QueryMessages(ctx context.Context, f MessagesFilter) ([]MessageRow, error) {
+	// Determine the effective limit.
+	// -1 means "no cap" (--all flag), 0 means "use default 200", >0 is explicit.
+	noLimit := f.Limit == -1
+	limit := f.Limit
+	if limit <= 0 && !noLimit {
+		limit = 200
+	}
+
+	q := `
+SELECT m.id, st.name, t.name, COALESCE(u.full_name,''), m.timestamp, m.content_text
+FROM messages m
+JOIN streams st ON st.id = m.stream_id
+JOIN topics t ON t.id = m.topic_id
+JOIN users u ON u.id = m.sender_id
+WHERE 1=1`
+	var args []any
+
+	if f.Stream != "" {
+		q += " AND st.name = ?"
+		args = append(args, f.Stream)
+	}
+	if f.Topic != "" {
+		q += " AND t.name = ?"
+		args = append(args, f.Topic)
+	}
+	if f.Sender != "" {
+		q += " AND u.full_name LIKE ?"
+		args = append(args, "%"+f.Sender+"%")
+	}
+	if f.Since != "" {
+		q += " AND m.timestamp >= ?"
+		args = append(args, f.Since)
+	}
+	if f.Until != "" {
+		q += " AND m.timestamp <= ?"
+		args = append(args, f.Until)
+	}
+	if f.Days > 0 || f.Hours > 0 {
+		window := time.Now().UTC().
+			Add(-time.Duration(f.Days)*24*time.Hour).
+			Add(-time.Duration(f.Hours)*time.Hour).
+			Format(time.RFC3339)
+		q += " AND m.timestamp >= ?"
+		args = append(args, window)
+	}
+
+	if f.Last > 0 {
+		// Pull the newest N then reverse them to oldest-first.
+		q += " ORDER BY m.timestamp DESC LIMIT ?"
+		args = append(args, f.Last)
+		rows, err := s.db.QueryContext(ctx, q, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []MessageRow
+		for rows.Next() {
+			var r MessageRow
+			if err := rows.Scan(&r.ID, &r.StreamName, &r.TopicName, &r.SenderName, &r.Timestamp, &r.Content); err != nil {
+				return nil, err
+			}
+			out = append(out, r)
+		}
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+		// Reverse to oldest-first.
+		for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+			out[i], out[j] = out[j], out[i]
+		}
+		return out, nil
+	}
+
+	if noLimit {
+		q += " ORDER BY m.timestamp ASC"
+	} else {
+		q += " ORDER BY m.timestamp ASC LIMIT ?"
+		args = append(args, limit)
+	}
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MessageRow
+	for rows.Next() {
+		var r MessageRow
+		if err := rows.Scan(&r.ID, &r.StreamName, &r.TopicName, &r.SenderName, &r.Timestamp, &r.Content); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) Ping(ctx context.Context) error {
 	return s.db.PingContext(ctx)
 }
