@@ -37,7 +37,7 @@ func (s *Store) InitSchema(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	schema := `
+	schemaCore := `
 CREATE TABLE IF NOT EXISTS organizations (
     id INTEGER PRIMARY KEY,
     url TEXT NOT NULL,
@@ -117,6 +117,12 @@ CREATE TABLE IF NOT EXISTS message_attachments (
     text_content TEXT,
     indexed INTEGER DEFAULT 0,
     timestamp TEXT NOT NULL,
+    media_path TEXT,
+    media_status TEXT,
+    media_fetched_at TEXT,
+    media_content_type TEXT,
+    media_bytes INTEGER,
+    media_error TEXT,
     UNIQUE(message_id, url)
 );
 
@@ -160,6 +166,15 @@ CREATE INDEX IF NOT EXISTS idx_attachments_stream_topic ON message_attachments(s
 CREATE INDEX IF NOT EXISTS idx_attachments_timestamp ON message_attachments(timestamp);
 CREATE INDEX IF NOT EXISTS idx_topics_stream ON topics(stream_id);
 CREATE INDEX IF NOT EXISTS idx_topics_resolved ON topics(resolved);
+`
+	if _, err := s.db.ExecContext(ctx, schemaCore); err != nil {
+		return err
+	}
+	if err := s.migrateAttachmentMediaColumns(ctx); err != nil {
+		return err
+	}
+	schemaAfterMigrations := `
+CREATE INDEX IF NOT EXISTS idx_attachments_media_status ON message_attachments(media_status);
 
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
   INSERT INTO messages_fts(rowid, content_text, topic_name, sender_name, attachment_text)
@@ -191,7 +206,7 @@ CREATE TRIGGER IF NOT EXISTS topics_au AFTER UPDATE ON topics BEGIN
   INSERT INTO topics_fts(rowid, name) VALUES(new.id, new.name);
 END;
 `
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
+	if _, err := s.db.ExecContext(ctx, schemaAfterMigrations); err != nil {
 		return err
 	}
 	if ftsMigrated {
@@ -200,6 +215,33 @@ END;
 		}
 	}
 	return s.InitEmbeddingSchema(ctx)
+}
+
+func (s *Store) migrateAttachmentMediaColumns(ctx context.Context) error {
+	cols := []string{
+		"media_path TEXT",
+		"media_status TEXT",
+		"media_fetched_at TEXT",
+		"media_content_type TEXT",
+		"media_bytes INTEGER",
+		"media_error TEXT",
+	}
+	for _, col := range cols {
+		parts := strings.Fields(col)
+		name := parts[0]
+		var existing string
+		err := s.db.QueryRowContext(ctx, `SELECT name FROM pragma_table_info('message_attachments') WHERE name = ?`, name).Scan(&existing)
+		if err == nil {
+			continue
+		}
+		if err != sql.ErrNoRows {
+			return err
+		}
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE message_attachments ADD COLUMN `+col); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) prepareFTSMigration(ctx context.Context) (bool, error) {
@@ -619,11 +661,11 @@ type SearchHit struct {
 
 // TopicSearchHit is a single result from a topic-level search.
 type TopicSearchHit struct {
-	TopicID      int64
-	StreamName   string
-	TopicName    string
-	Resolved     bool
-	MessageCount int64
+	TopicID        int64
+	StreamName     string
+	TopicName      string
+	Resolved       bool
+	MessageCount   int64
 	LastMessageAt  string
 	FirstMessageAt string
 	// BestSnippet is a representative snippet from the best-matching message.
@@ -1272,4 +1314,101 @@ func (s *Store) EnsureStreamByName(ctx context.Context, orgID int64, streamID in
 		return fmt.Errorf("stream id missing")
 	}
 	return s.UpsertStream(ctx, Stream{ID: streamID, OrgID: orgID, Name: name})
+}
+
+// AttachmentRow is a locally indexed Zulip upload and its optional media-cache metadata.
+type AttachmentRow struct {
+	ID               int64
+	MessageID        int64
+	StreamName       string
+	TopicName        string
+	SenderName       string
+	URL              string
+	FileName         string
+	Title            string
+	ContentType      string
+	Timestamp        string
+	MediaPath        string
+	MediaStatus      string
+	MediaFetchedAt   string
+	MediaContentType string
+	MediaBytes       int64
+	MediaError       string
+}
+
+type AttachmentFilter struct {
+	Stream string
+	Topic  string
+	Status string // pending, fetched, error, or empty for all
+	Limit  int
+}
+
+func (s *Store) ListAttachments(ctx context.Context, f AttachmentFilter) ([]AttachmentRow, error) {
+	limit := f.Limit
+	q := `
+SELECT a.id, a.message_id, st.name, t.name, COALESCE(u.full_name,''), a.url,
+       COALESCE(a.file_name,''), COALESCE(a.title,''), COALESCE(a.content_type,''), a.timestamp,
+       COALESCE(a.media_path,''), COALESCE(a.media_status,''), COALESCE(a.media_fetched_at,''),
+       COALESCE(a.media_content_type,''), COALESCE(a.media_bytes,0), COALESCE(a.media_error,'')
+FROM message_attachments a
+JOIN messages m ON m.id = a.message_id
+JOIN streams st ON st.id = a.stream_id
+JOIN topics t ON t.id = a.topic_id
+LEFT JOIN users u ON u.id = m.sender_id
+WHERE 1=1`
+	args := []any{}
+	if f.Stream != "" {
+		q += " AND st.name = ?"
+		args = append(args, f.Stream)
+	}
+	if f.Topic != "" {
+		q += " AND t.name = ?"
+		args = append(args, f.Topic)
+	}
+	switch f.Status {
+	case "pending":
+		q += " AND (a.media_status IS NULL OR a.media_status = '' OR a.media_status = 'error')"
+	case "fetched", "error":
+		q += " AND a.media_status = ?"
+		args = append(args, f.Status)
+	case "", "all":
+	default:
+		return nil, fmt.Errorf("unknown attachment status %q", f.Status)
+	}
+	q += " ORDER BY a.timestamp DESC, a.id DESC"
+	if limit > 0 {
+		q += " LIMIT ?"
+		args = append(args, limit)
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AttachmentRow
+	for rows.Next() {
+		var r AttachmentRow
+		if err := rows.Scan(&r.ID, &r.MessageID, &r.StreamName, &r.TopicName, &r.SenderName, &r.URL, &r.FileName, &r.Title, &r.ContentType, &r.Timestamp, &r.MediaPath, &r.MediaStatus, &r.MediaFetchedAt, &r.MediaContentType, &r.MediaBytes, &r.MediaError); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+type AttachmentMediaUpdate struct {
+	Path        string
+	Status      string
+	FetchedAt   string
+	ContentType string
+	Bytes       int64
+	Error       string
+}
+
+func (s *Store) UpdateAttachmentMedia(ctx context.Context, id int64, u AttachmentMediaUpdate) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE message_attachments
+SET media_path = ?, media_status = ?, media_fetched_at = ?, media_content_type = ?, media_bytes = ?, media_error = ?
+WHERE id = ?`, nullIfEmpty(u.Path), nullIfEmpty(u.Status), nullIfEmpty(u.FetchedAt), nullIfEmpty(u.ContentType), u.Bytes, nullIfEmpty(u.Error), id)
+	return err
 }

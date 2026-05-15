@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -181,5 +183,142 @@ func TestEnsureMessageSenderInsertsNewUser(t *testing.T) {
 	}
 	if fullName != "Ghost Bot" {
 		t.Errorf("full_name = %q, want %q", fullName, "Ghost Bot")
+	}
+}
+
+func TestInitSchemaMigratesAttachmentMediaColumnsBeforeIndex(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	_, err = db.ExecContext(ctx, `
+CREATE TABLE message_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    org_id INTEGER NOT NULL,
+    stream_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    url TEXT NOT NULL,
+    file_name TEXT,
+    title TEXT,
+    content_type TEXT,
+    text_content TEXT,
+    indexed INTEGER DEFAULT 0,
+    timestamp TEXT NOT NULL,
+    UNIQUE(message_id, url)
+);
+`)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("create old attachment table: %v", err)
+	}
+	_ = db.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	if err := st.InitSchema(ctx); err != nil {
+		t.Fatalf("InitSchema should migrate old attachment schema before creating media index: %v", err)
+	}
+	var indexed string
+	if err := st.db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='index' AND name='idx_attachments_media_status'`).Scan(&indexed); err != nil {
+		t.Fatalf("media status index missing after migration: %v", err)
+	}
+}
+
+func TestAttachmentMediaMetadata(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	topicID, err := st.GetOrCreateTopic(ctx, 1, 10, "triage")
+	if err != nil {
+		t.Fatalf("GetOrCreateTopic: %v", err)
+	}
+	msg := Message{
+		ID:            200,
+		OrgID:         1,
+		StreamID:      10,
+		TopicID:       topicID,
+		SenderID:      20,
+		Content:       "file",
+		ContentText:   "file",
+		Timestamp:     "2026-01-02T03:04:05Z",
+		HasAttachment: true,
+		Attachments: []Attachment{{
+			URL:      "/user_uploads/a/report.txt",
+			FileName: "report.txt",
+		}},
+	}
+	if err := st.UpsertMessage(ctx, msg); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	rows, err := st.ListAttachments(ctx, AttachmentFilter{Status: "pending"})
+	if err != nil {
+		t.Fatalf("ListAttachments: %v", err)
+	}
+	if len(rows) != 1 || rows[0].MediaStatus != "" {
+		t.Fatalf("pending rows = %#v", rows)
+	}
+	if err := st.UpdateAttachmentMedia(ctx, rows[0].ID, AttachmentMediaUpdate{
+		Path:        "/tmp/report.txt",
+		Status:      "fetched",
+		FetchedAt:   "2026-01-02T04:00:00Z",
+		ContentType: "text/plain",
+		Bytes:       12,
+	}); err != nil {
+		t.Fatalf("UpdateAttachmentMedia: %v", err)
+	}
+	rows, err = st.ListAttachments(ctx, AttachmentFilter{Status: "fetched"})
+	if err != nil {
+		t.Fatalf("ListAttachments fetched: %v", err)
+	}
+	if len(rows) != 1 || rows[0].MediaPath != "/tmp/report.txt" || rows[0].MediaBytes != 12 {
+		t.Fatalf("fetched rows = %#v", rows)
+	}
+}
+
+func TestListAttachmentsLimitSemantics(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	topicID, err := st.GetOrCreateTopic(ctx, 1, 10, "triage")
+	if err != nil {
+		t.Fatalf("GetOrCreateTopic: %v", err)
+	}
+	for i := int64(1); i <= 105; i++ {
+		msg := Message{
+			ID:            1000 + i,
+			OrgID:         1,
+			StreamID:      10,
+			TopicID:       topicID,
+			SenderID:      20,
+			Content:       "file",
+			ContentText:   "file",
+			Timestamp:     "2026-01-02T03:04:05Z",
+			HasAttachment: true,
+			Attachments: []Attachment{{
+				URL:      fmt.Sprintf("/user_uploads/a/file%03d.txt", i),
+				FileName: "file.txt",
+			}},
+		}
+		if err := st.UpsertMessage(ctx, msg); err != nil {
+			t.Fatalf("UpsertMessage %d: %v", i, err)
+		}
+	}
+
+	rows, err := st.ListAttachments(ctx, AttachmentFilter{Status: "pending"})
+	if err != nil {
+		t.Fatalf("ListAttachments unlimited: %v", err)
+	}
+	if len(rows) != 105 {
+		t.Fatalf("unlimited ListAttachments returned %d rows, want 105", len(rows))
+	}
+
+	rows, err = st.ListAttachments(ctx, AttachmentFilter{Status: "pending", Limit: 100})
+	if err != nil {
+		t.Fatalf("ListAttachments limited: %v", err)
+	}
+	if len(rows) != 100 {
+		t.Fatalf("limited ListAttachments returned %d rows, want 100", len(rows))
 	}
 }

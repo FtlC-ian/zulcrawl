@@ -15,6 +15,7 @@ import (
 	"github.com/FtlC-ian/zulcrawl/internal/embed"
 	"github.com/FtlC-ian/zulcrawl/internal/embeddings"
 	"github.com/FtlC-ian/zulcrawl/internal/lock"
+	"github.com/FtlC-ian/zulcrawl/internal/media"
 	"github.com/FtlC-ian/zulcrawl/internal/search"
 	"github.com/FtlC-ian/zulcrawl/internal/store"
 	"github.com/FtlC-ian/zulcrawl/internal/syncer"
@@ -41,6 +42,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(statsCmd(loadCfg))
 	root.AddCommand(sqlCmd(loadCfg))
 	root.AddCommand(messagesCmd(loadCfg))
+	root.AddCommand(attachmentsCmd(loadCfg))
 	root.AddCommand(backfillIndexesCmd(loadCfg))
 	root.AddCommand(embeddingsCmd(loadCfg))
 	return root
@@ -152,6 +154,7 @@ func syncCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 	var since string
 	var streams string
 	var quiet bool
+	var withMedia bool
 	cmd := &cobra.Command{
 		Use:   "sync",
 		Short: "Sync streams/messages from Zulip",
@@ -212,6 +215,13 @@ func syncCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 			if err := sy.Sync(ctx, syncer.Options{Full: full, Streams: include, Since: since}); err != nil {
 				return err
 			}
+			if withMedia {
+				res, err := media.FetchPending(ctx, st, api, media.FetchOptions{CacheDir: cfg.MediaCacheDir()})
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "media fetch: %d fetched, %d skipped, %d failed\n", res.Fetched, res.Skipped, res.Failed)
+			}
 			fmt.Printf("sync complete in %s\n", time.Since(start).Round(time.Millisecond))
 			return nil
 		},
@@ -220,6 +230,7 @@ func syncCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 	cmd.Flags().StringVar(&streams, "streams", "", "comma-separated stream names")
 	cmd.Flags().StringVar(&since, "since", "", "only include messages since date (YYYY-MM-DD)")
 	cmd.Flags().BoolVar(&quiet, "quiet", false, "suppress progress output (only print final summary or errors)")
+	cmd.Flags().BoolVar(&withMedia, "with-media", false, "download indexed Zulip attachment media into the local cache after sync")
 	return cmd
 }
 
@@ -609,6 +620,103 @@ The default safety limit is 200 messages; use --limit or --all to override.`,
 	cmd.Flags().IntVar(&last, "last", 0, "return the N most recent messages (oldest-first output)")
 	cmd.Flags().IntVar(&limit, "limit", 200, "maximum messages to return (default 200)")
 	cmd.Flags().BoolVar(&all, "all", false, "remove safety limit and return all matching messages")
+	return cmd
+}
+
+func attachmentsCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
+	var stream string
+	var topic string
+	var status string
+	var limit int
+	cmd := &cobra.Command{
+		Use:   "attachments",
+		Short: "List indexed Zulip attachments and local media cache status",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadCfg()
+			if err != nil {
+				return err
+			}
+			st, err := store.Open(cfg.DBPath())
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			if err := st.InitSchema(cmd.Context()); err != nil {
+				return err
+			}
+			rows, err := st.ListAttachments(cmd.Context(), store.AttachmentFilter{Stream: stream, Topic: topic, Status: status, Limit: limit})
+			if err != nil {
+				return err
+			}
+			if len(rows) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "No attachments found.")
+				return nil
+			}
+			for _, a := range rows {
+				stText := a.MediaStatus
+				if stText == "" {
+					stText = "pending"
+				}
+				name := a.FileName
+				if name == "" {
+					name = a.Title
+				}
+				fmt.Fprintf(cmd.OutOrStdout(), "%d\tmsg:%d\t%s\t#%s > %s\t%s\t%s\n", a.ID, a.MessageID, stText, a.StreamName, a.TopicName, name, a.URL)
+				if a.MediaPath != "" || a.MediaError != "" {
+					fmt.Fprintf(cmd.OutOrStdout(), "\tpath:%s\tbytes:%d\terror:%s\n", a.MediaPath, a.MediaBytes, a.MediaError)
+				}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&stream, "stream", "", "filter by stream name")
+	cmd.Flags().StringVar(&topic, "topic", "", "filter by topic name")
+	cmd.Flags().StringVar(&status, "status", "", "filter by media status: pending, fetched, error, all")
+	cmd.Flags().IntVar(&limit, "limit", 100, "row limit")
+	cmd.AddCommand(attachmentsFetchCmd(loadCfg))
+	return cmd
+}
+
+func attachmentsFetchCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
+	var limit int
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "fetch",
+		Short: "Download indexed Zulip /user_uploads/ attachments into the local cache",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := loadCfg()
+			if err != nil {
+				return err
+			}
+			if err := cfg.ValidateAuth(); err != nil {
+				return err
+			}
+			lockPath := cfg.DBPath() + ".lock"
+			l, err := lock.Acquire(lockPath)
+			if err != nil {
+				return err
+			}
+			defer l.Release()
+			st, err := store.Open(cfg.DBPath())
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			if err := st.InitSchema(cmd.Context()); err != nil {
+				return err
+			}
+			api := zulip.NewClient(cfg.Zulip.URL, cfg.Zulip.Email, cfg.Zulip.APIKey)
+			res, err := media.FetchPending(cmd.Context(), st, api, media.FetchOptions{CacheDir: cfg.MediaCacheDir(), Limit: limit, Force: force})
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "media fetch: %d fetched, %d skipped, %d failed\n", res.Fetched, res.Skipped, res.Failed)
+			fmt.Fprintf(cmd.OutOrStdout(), "cache: %s\n", cfg.MediaCacheDir())
+			return nil
+		},
+	}
+	cmd.Flags().IntVar(&limit, "limit", 0, "maximum attachments to fetch (default all pending/error)")
+	cmd.Flags().BoolVar(&force, "force", false, "refetch attachments even if already fetched")
 	return cmd
 }
 

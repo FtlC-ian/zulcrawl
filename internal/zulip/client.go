@@ -55,16 +55,16 @@ type User struct {
 }
 
 type Message struct {
-	ID             int64           `json:"id"`
-	SenderID       int64           `json:"sender_id"`
-	SenderFullName string          `json:"sender_full_name"`
-	StreamID       int64           `json:"stream_id"`
-	Subject        string          `json:"subject"`
-	Topic          string          `json:"topic"`
-	Content        string          `json:"content"`
-	Timestamp      int64           `json:"timestamp"`
-	EditTimestamp  int64           `json:"edit_timestamp"`
-	Type           string          `json:"type"`
+	ID             int64  `json:"id"`
+	SenderID       int64  `json:"sender_id"`
+	SenderFullName string `json:"sender_full_name"`
+	StreamID       int64  `json:"stream_id"`
+	Subject        string `json:"subject"`
+	Topic          string `json:"topic"`
+	Content        string `json:"content"`
+	Timestamp      int64  `json:"timestamp"`
+	EditTimestamp  int64  `json:"edit_timestamp"`
+	Type           string `json:"type"`
 	// IsMe is true for /me action messages (Zulip field: is_me_message).
 	// This is distinct from Type=="private" which indicates a direct message.
 	IsMe      bool            `json:"is_me_message"`
@@ -90,6 +90,17 @@ type getUsersResp struct {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, out any) error {
+	body, _, err := c.doRaw(ctx, method, path, q)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("decode %s: %w", path, err)
+	}
+	return nil
+}
+
+func (c *Client) doRaw(ctx context.Context, method, path string, q url.Values) ([]byte, http.Header, error) {
 	u := c.baseURL + path
 	if len(q) > 0 {
 		u += "?" + q.Encode()
@@ -99,7 +110,7 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, out 
 	for attempt := 0; attempt < 5; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, method, u, nil)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		req.SetBasicAuth(c.email, c.apiKey)
 
@@ -124,11 +135,7 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, out 
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("zulip api %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
-		}
-
-		if err := json.Unmarshal(body, out); err != nil {
-			return fmt.Errorf("decode %s: %w", path, err)
+			return nil, nil, fmt.Errorf("zulip api %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 
 		if rem := resp.Header.Get("X-RateLimit-Remaining"); rem != "" {
@@ -136,12 +143,75 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, out 
 				time.Sleep(1500 * time.Millisecond)
 			}
 		}
-		return nil
+		return body, resp.Header.Clone(), nil
 	}
 	if lastErr != nil {
-		return lastErr
+		return nil, nil, lastErr
 	}
-	return fmt.Errorf("zulip api %s failed after retries", path)
+	return nil, nil, fmt.Errorf("zulip api %s failed after retries", path)
+}
+
+// Download fetches a Zulip-hosted upload using the same basic auth credentials
+// as API calls. Only local /user_uploads/ paths are accepted. The response body
+// is streamed to the caller; callers must close it.
+func (c *Client) Download(ctx context.Context, path string) (io.ReadCloser, string, error) {
+	resp, err := c.downloadResponse(ctx, path)
+	if err != nil {
+		return nil, "", err
+	}
+	return resp.Body, resp.Header.Get("Content-Type"), nil
+}
+
+func (c *Client) downloadResponse(ctx context.Context, path string) (*http.Response, error) {
+	if !strings.HasPrefix(path, "/user_uploads/") {
+		return nil, fmt.Errorf("not a Zulip upload path: %s", path)
+	}
+	u := c.baseURL + path
+
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.SetBasicAuth(c.email, c.apiKey)
+
+		resp, err := c.hc.Do(req)
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			_ = resp.Body.Close()
+			wait := 2 * time.Second
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if n, err := strconv.Atoi(ra); err == nil {
+					wait = time.Duration(n) * time.Second
+				}
+			}
+			time.Sleep(wait)
+			continue
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("zulip download %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+
+		if rem := resp.Header.Get("X-RateLimit-Remaining"); rem != "" {
+			if n, err := strconv.Atoi(rem); err == nil && n < 5 {
+				time.Sleep(1500 * time.Millisecond)
+			}
+		}
+		return resp, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("zulip download %s failed after retries", path)
 }
 
 func (c *Client) ServerSettings(ctx context.Context) (*ServerSettings, error) {
