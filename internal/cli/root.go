@@ -42,6 +42,7 @@ func NewRootCmd() *cobra.Command {
 	root.AddCommand(statsCmd(loadCfg))
 	root.AddCommand(sqlCmd(loadCfg))
 	root.AddCommand(messagesCmd(loadCfg))
+	root.AddCommand(digestCmd(loadCfg))
 	root.AddCommand(attachmentsCmd(loadCfg))
 	root.AddCommand(backfillIndexesCmd(loadCfg))
 	root.AddCommand(embeddingsCmd(loadCfg))
@@ -621,6 +622,190 @@ The default safety limit is 200 messages; use --limit or --all to override.`,
 	cmd.Flags().IntVar(&limit, "limit", 200, "maximum messages to return (default 200)")
 	cmd.Flags().BoolVar(&all, "all", false, "remove safety limit and return all matching messages")
 	return cmd
+}
+
+type digestJSONOutput struct {
+	Stream                string                  `json:"stream"`
+	Topics                []digestJSONRow         `json:"topics"`
+	MentionHeavyTopics    []digestJSONTopicSignal `json:"mention_heavy_topics"`
+	AttachmentHeavyTopics []digestJSONTopicSignal `json:"attachment_heavy_topics"`
+}
+
+type digestJSONRow struct {
+	Stream       string   `json:"stream"`
+	Topic        string   `json:"topic"`
+	Messages     int      `json:"messages"`
+	FirstAt      string   `json:"first_at"`
+	LastAt       string   `json:"last_at"`
+	Participants []string `json:"participants"`
+	Preview      string   `json:"preview"`
+}
+
+type digestJSONTopicSignal struct {
+	Stream string `json:"stream"`
+	Topic  string `json:"topic"`
+	Count  int    `json:"count"`
+	LastAt string `json:"last_at"`
+}
+
+func digestCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
+	var stream, since, until string
+	var limit int
+	var jsonOut bool
+
+	cmd := &cobra.Command{
+		Use:   "digest",
+		Short: "Summarize local archive activity by topic",
+		Long: `Summarize local SQLite archive activity by topic without calling Zulip.
+
+The digest is intentionally local-only: it reads the mirrored SQLite database,
+groups messages by topic, and prints message counts, date range, participants,
+and a latest-message preview. Use --stream and --since to keep the slice bounded.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if stream == "" {
+				return fmt.Errorf("--stream is required")
+			}
+			if since == "" {
+				return fmt.Errorf("--since is required")
+			}
+			if limit <= 0 {
+				return fmt.Errorf("--limit must be positive")
+			}
+
+			normSince, err := normalizeCLITime("since", since, false)
+			if err != nil {
+				return err
+			}
+			normUntil := ""
+			if until != "" {
+				normUntil, err = normalizeCLITime("until", until, true)
+				if err != nil {
+					return err
+				}
+			}
+
+			cfg, err := loadCfg()
+			if err != nil {
+				return err
+			}
+			st, err := store.Open(cfg.DBPath())
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+
+			filter := store.DigestFilter{
+				Stream: stream,
+				Since:  normSince,
+				Until:  normUntil,
+				Limit:  limit,
+			}
+			rows, err := st.Digest(cmd.Context(), filter)
+			if err != nil {
+				return err
+			}
+			mentionHeavy, err := st.DigestMentionHeavyTopics(cmd.Context(), filter)
+			if err != nil {
+				return err
+			}
+			attachmentHeavy, err := st.DigestAttachmentHeavyTopics(cmd.Context(), filter)
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				out := digestJSONOutput{
+					Stream:                stream,
+					Topics:                make([]digestJSONRow, 0, len(rows)),
+					MentionHeavyTopics:    digestJSONSignals(mentionHeavy),
+					AttachmentHeavyTopics: digestJSONSignals(attachmentHeavy),
+				}
+				for _, r := range rows {
+					out.Topics = append(out.Topics, digestJSONRow{
+						Stream:       r.StreamName,
+						Topic:        r.TopicName,
+						Messages:     r.MessageCount,
+						FirstAt:      r.FirstMessageAt,
+						LastAt:       r.LastMessageAt,
+						Participants: r.Participants,
+						Preview:      r.Preview,
+					})
+				}
+				enc := json.NewEncoder(cmd.OutOrStdout())
+				enc.SetIndent("", "  ")
+				return enc.Encode(out)
+			}
+			if len(rows) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "No digest entries found.")
+				return nil
+			}
+			for _, r := range rows {
+				fmt.Fprintf(cmd.OutOrStdout(), "#%s > %s (%d messages, %s to %s)\n",
+					r.StreamName, r.TopicName, r.MessageCount, formatDigestTime(r.FirstMessageAt), formatDigestTime(r.LastMessageAt))
+				if len(r.Participants) > 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "  participants: %s\n", strings.Join(r.Participants, ", "))
+				}
+				if r.Preview != "" {
+					fmt.Fprintf(cmd.OutOrStdout(), "  latest: %s\n", r.Preview)
+				}
+				fmt.Fprintln(cmd.OutOrStdout())
+			}
+			printDigestSignals(cmd, "Mention-heavy topics", mentionHeavy, "mentions")
+			printDigestSignals(cmd, "Attachment-heavy topics", attachmentHeavy, "attachments")
+			fmt.Fprintf(cmd.OutOrStdout(), "(%d topics)\n", len(rows))
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&stream, "stream", "", "stream name (required)")
+	cmd.Flags().StringVar(&since, "since", "", "include messages at or after this time (RFC3339 or YYYY-MM-DD; required)")
+	cmd.Flags().StringVar(&until, "until", "", "include messages at or before this time (RFC3339 or YYYY-MM-DD)")
+	cmd.Flags().IntVar(&limit, "limit", 20, "maximum topics to return")
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON instead of text")
+	return cmd
+}
+
+func digestJSONSignals(rows []store.DigestTopicSignal) []digestJSONTopicSignal {
+	out := make([]digestJSONTopicSignal, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, digestJSONTopicSignal{
+			Stream: r.StreamName,
+			Topic:  r.TopicName,
+			Count:  r.Count,
+			LastAt: r.LastAt,
+		})
+	}
+	return out
+}
+
+func printDigestSignals(cmd *cobra.Command, title string, rows []store.DigestTopicSignal, unit string) {
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "%s:\n", title)
+	for _, r := range rows {
+		fmt.Fprintf(cmd.OutOrStdout(), "  #%s > %s (%d %s, last %s)\n",
+			r.StreamName, r.TopicName, r.Count, unit, formatDigestTime(r.LastAt))
+	}
+	fmt.Fprintln(cmd.OutOrStdout())
+}
+
+func normalizeCLITime(flagName, val string, endOfDay bool) (string, error) {
+	if t, err := time.Parse(time.RFC3339, val); err == nil {
+		return t.UTC().Format(time.RFC3339), nil
+	}
+	if _, err := time.Parse("2006-01-02", val); err != nil {
+		return "", fmt.Errorf("--%s must be RFC3339 (2006-01-02T15:04:05Z) or YYYY-MM-DD, got %q", flagName, val)
+	}
+	if endOfDay {
+		return val + "T23:59:59Z", nil
+	}
+	return val + "T00:00:00Z", nil
+}
+
+func formatDigestTime(ts string) string {
+	if t, err := time.Parse(time.RFC3339, ts); err == nil {
+		return t.Format("2006-01-02 15:04")
+	}
+	return ts
 }
 
 func attachmentsCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
