@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -185,8 +186,51 @@ func TestEnsureMessageSenderInsertsNewUser(t *testing.T) {
 	}
 }
 
-func TestAttachmentMediaMetadata(t *testing.T) {
+func TestInitSchemaMigratesAttachmentMediaColumnsBeforeIndex(t *testing.T) {
 	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	_, err = db.ExecContext(ctx, `
+CREATE TABLE message_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    org_id INTEGER NOT NULL,
+    stream_id INTEGER NOT NULL,
+    topic_id INTEGER NOT NULL,
+    url TEXT NOT NULL,
+    file_name TEXT,
+    title TEXT,
+    content_type TEXT,
+    text_content TEXT,
+    indexed INTEGER DEFAULT 0,
+    timestamp TEXT NOT NULL,
+    UNIQUE(message_id, url)
+);
+`)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("create old attachment table: %v", err)
+	}
+	_ = db.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	if err := st.InitSchema(ctx); err != nil {
+		t.Fatalf("InitSchema should migrate old attachment schema before creating media index: %v", err)
+	}
+	var indexed string
+	if err := st.db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='index' AND name='idx_attachments_media_status'`).Scan(&indexed); err != nil {
+		t.Fatalf("media status index missing after migration: %v", err)
+	}
+}
+
+func TestAttachmentMediaMetadata(t *testing.T) {
 	st, ctx := setupTestStore(t)
 	topicID, err := st.GetOrCreateTopic(ctx, 1, 10, "triage")
 	if err != nil {

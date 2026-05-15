@@ -37,7 +37,7 @@ func (s *Store) InitSchema(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	schema := `
+	schemaCore := `
 CREATE TABLE IF NOT EXISTS organizations (
     id INTEGER PRIMARY KEY,
     url TEXT NOT NULL,
@@ -164,9 +164,17 @@ CREATE INDEX IF NOT EXISTS idx_mentions_timestamp ON message_mentions(timestamp)
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON message_attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_stream_topic ON message_attachments(stream_id, topic_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_timestamp ON message_attachments(timestamp);
-CREATE INDEX IF NOT EXISTS idx_attachments_media_status ON message_attachments(media_status);
 CREATE INDEX IF NOT EXISTS idx_topics_stream ON topics(stream_id);
 CREATE INDEX IF NOT EXISTS idx_topics_resolved ON topics(resolved);
+`
+	if _, err := s.db.ExecContext(ctx, schemaCore); err != nil {
+		return err
+	}
+	if err := s.migrateAttachmentMediaColumns(ctx); err != nil {
+		return err
+	}
+	schemaAfterMigrations := `
+CREATE INDEX IF NOT EXISTS idx_attachments_media_status ON message_attachments(media_status);
 
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
   INSERT INTO messages_fts(rowid, content_text, topic_name, sender_name, attachment_text)
@@ -198,10 +206,7 @@ CREATE TRIGGER IF NOT EXISTS topics_au AFTER UPDATE ON topics BEGIN
   INSERT INTO topics_fts(rowid, name) VALUES(new.id, new.name);
 END;
 `
-	if _, err := s.db.ExecContext(ctx, schema); err != nil {
-		return err
-	}
-	if err := s.migrateAttachmentMediaColumns(ctx); err != nil {
+	if _, err := s.db.ExecContext(ctx, schemaAfterMigrations); err != nil {
 		return err
 	}
 	if ftsMigrated {
