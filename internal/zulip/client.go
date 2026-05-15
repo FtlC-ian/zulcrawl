@@ -1,6 +1,7 @@
 package zulip
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -55,16 +56,16 @@ type User struct {
 }
 
 type Message struct {
-	ID             int64           `json:"id"`
-	SenderID       int64           `json:"sender_id"`
-	SenderFullName string          `json:"sender_full_name"`
-	StreamID       int64           `json:"stream_id"`
-	Subject        string          `json:"subject"`
-	Topic          string          `json:"topic"`
-	Content        string          `json:"content"`
-	Timestamp      int64           `json:"timestamp"`
-	EditTimestamp  int64           `json:"edit_timestamp"`
-	Type           string          `json:"type"`
+	ID             int64  `json:"id"`
+	SenderID       int64  `json:"sender_id"`
+	SenderFullName string `json:"sender_full_name"`
+	StreamID       int64  `json:"stream_id"`
+	Subject        string `json:"subject"`
+	Topic          string `json:"topic"`
+	Content        string `json:"content"`
+	Timestamp      int64  `json:"timestamp"`
+	EditTimestamp  int64  `json:"edit_timestamp"`
+	Type           string `json:"type"`
 	// IsMe is true for /me action messages (Zulip field: is_me_message).
 	// This is distinct from Type=="private" which indicates a direct message.
 	IsMe      bool            `json:"is_me_message"`
@@ -90,6 +91,17 @@ type getUsersResp struct {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, out any) error {
+	body, _, err := c.doRaw(ctx, method, path, q)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("decode %s: %w", path, err)
+	}
+	return nil
+}
+
+func (c *Client) doRaw(ctx context.Context, method, path string, q url.Values) ([]byte, http.Header, error) {
 	u := c.baseURL + path
 	if len(q) > 0 {
 		u += "?" + q.Encode()
@@ -99,7 +111,7 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, out 
 	for attempt := 0; attempt < 5; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, method, u, nil)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		req.SetBasicAuth(c.email, c.apiKey)
 
@@ -124,11 +136,7 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, out 
 		}
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("zulip api %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
-		}
-
-		if err := json.Unmarshal(body, out); err != nil {
-			return fmt.Errorf("decode %s: %w", path, err)
+			return nil, nil, fmt.Errorf("zulip api %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
 		}
 
 		if rem := resp.Header.Get("X-RateLimit-Remaining"); rem != "" {
@@ -136,12 +144,25 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, out 
 				time.Sleep(1500 * time.Millisecond)
 			}
 		}
-		return nil
+		return body, resp.Header.Clone(), nil
 	}
 	if lastErr != nil {
-		return lastErr
+		return nil, nil, lastErr
 	}
-	return fmt.Errorf("zulip api %s failed after retries", path)
+	return nil, nil, fmt.Errorf("zulip api %s failed after retries", path)
+}
+
+// Download fetches a Zulip-hosted upload using the same basic auth credentials
+// as API calls. Only local /user_uploads/ paths are accepted.
+func (c *Client) Download(ctx context.Context, path string) (io.ReadCloser, string, error) {
+	if !strings.HasPrefix(path, "/user_uploads/") {
+		return nil, "", fmt.Errorf("not a Zulip upload path: %s", path)
+	}
+	body, hdr, err := c.doRaw(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	return io.NopCloser(bytes.NewReader(body)), hdr.Get("Content-Type"), nil
 }
 
 func (c *Client) ServerSettings(ctx context.Context) (*ServerSettings, error) {

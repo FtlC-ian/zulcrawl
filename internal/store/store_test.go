@@ -183,3 +183,53 @@ func TestEnsureMessageSenderInsertsNewUser(t *testing.T) {
 		t.Errorf("full_name = %q, want %q", fullName, "Ghost Bot")
 	}
 }
+
+func TestAttachmentMediaMetadata(t *testing.T) {
+	ctx := context.Background()
+	st, ctx := setupTestStore(t)
+	topicID, err := st.GetOrCreateTopic(ctx, 1, 10, "triage")
+	if err != nil {
+		t.Fatalf("GetOrCreateTopic: %v", err)
+	}
+	msg := Message{
+		ID:            200,
+		OrgID:         1,
+		StreamID:      10,
+		TopicID:       topicID,
+		SenderID:      20,
+		Content:       "file",
+		ContentText:   "file",
+		Timestamp:     "2026-01-02T03:04:05Z",
+		HasAttachment: true,
+		Attachments: []Attachment{{
+			URL:      "/user_uploads/a/report.txt",
+			FileName: "report.txt",
+		}},
+	}
+	if err := st.UpsertMessage(ctx, msg); err != nil {
+		t.Fatalf("UpsertMessage: %v", err)
+	}
+	rows, err := st.ListAttachments(ctx, AttachmentFilter{Status: "pending"})
+	if err != nil {
+		t.Fatalf("ListAttachments: %v", err)
+	}
+	if len(rows) != 1 || rows[0].MediaStatus != "" {
+		t.Fatalf("pending rows = %#v", rows)
+	}
+	if err := st.UpdateAttachmentMedia(ctx, rows[0].ID, AttachmentMediaUpdate{
+		Path:        "/tmp/report.txt",
+		Status:      "fetched",
+		FetchedAt:   "2026-01-02T04:00:00Z",
+		ContentType: "text/plain",
+		Bytes:       12,
+	}); err != nil {
+		t.Fatalf("UpdateAttachmentMedia: %v", err)
+	}
+	rows, err = st.ListAttachments(ctx, AttachmentFilter{Status: "fetched"})
+	if err != nil {
+		t.Fatalf("ListAttachments fetched: %v", err)
+	}
+	if len(rows) != 1 || rows[0].MediaPath != "/tmp/report.txt" || rows[0].MediaBytes != 12 {
+		t.Fatalf("fetched rows = %#v", rows)
+	}
+}

@@ -10,13 +10,14 @@
 - Cobra CLI commands:
   - `init`
   - `doctor`
-  - `sync --full --streams --since [--quiet]`
+  - `sync --full --streams --since [--quiet] [--with-media]`
   - `search`
   - `topics` — list topics or topic-level hybrid search
   - `topics search` — hybrid search: FTS on topic names + message content (see below)
   - `stats`
   - `sql`
   - `messages` — direct archive slice queries (see below)
+  - `attachments` / `attachments fetch` — list indexed uploads and cache Zulip media locally
   - `backfill-indexes` — rebuild mention/attachment indexes for existing messages
   - `embeddings backfill` — build/update Ollama topic embeddings (disabled by default)
   - `embeddings status` — show embedding coverage
@@ -27,17 +28,26 @@
 - Topic-level hybrid search: two-leg FTS (topic names + message content) with activity/recency scoring
 - Mention and attachment indexes parsed from rendered HTML
 
-## Attachment indexing — current scope
+## Attachment indexing and local media cache
 
-Attachment indexing covers **text already present in the Zulip-rendered HTML** of
-each message — inline previews and short snippets that Zulip embeds in the
-rendered `<div class="message_inline_ref">` block.  It does **not** fetch or
-parse the actual uploaded file contents (PDFs, images, Office documents, etc.).
-For text-heavy attachments the best coverage comes from users quoting or
-summarising content in the message body itself.
+Attachment indexing covers `/user_uploads/...` links found in Zulip-rendered
+message HTML, plus any text already present in inline preview blocks. `zulcrawl`
+can also download the original upload bytes into a **local-only** cache using the
+same Zulip API credentials:
 
-Full file-content extraction (downloading from `/user_uploads/…` and parsing
-the file bytes) is a planned future enhancement and is **not implemented**.
+```bash
+zulcrawl attachments                 # list indexed attachments and cache status
+zulcrawl attachments --status pending --stream engineering
+zulcrawl attachments fetch           # download pending/error uploads
+zulcrawl sync --with-media           # sync, then fetch media
+```
+
+Cached media defaults to `~/.zulcrawl/media` and is tracked in SQLite with path,
+status, fetched timestamp, content type, byte count, and last error. It is never
+published or uploaded by zulcrawl.
+
+Full file-content extraction/parsing (PDFs, images, Office documents, etc.) is
+still a future enhancement; downloaded media is cached as bytes only.
 
 ## Build
 
@@ -57,6 +67,9 @@ api_key = ""
 
 [database]
 path = "~/.zulcrawl/zulcrawl.db"
+
+[media]
+cache_dir = "~/.zulcrawl/media"
 
 [sync]
 concurrency = 4
@@ -90,6 +103,13 @@ zulcrawl sync --since 2026-01-01
 
 # Sync silently (suppress progress lines, show only final summary or errors)
 zulcrawl sync --quiet
+
+# Sync and then cache indexed Zulip upload bytes locally
+zulcrawl sync --with-media
+
+# List and fetch attachment media
+zulcrawl attachments --status pending
+zulcrawl attachments fetch
 
 # Search
 zulcrawl search "database migration"

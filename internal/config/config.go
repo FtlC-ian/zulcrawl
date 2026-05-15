@@ -19,6 +19,11 @@ type Config struct {
 	Database struct {
 		Path string `toml:"path"`
 	} `toml:"database"`
+	Media struct {
+		// CacheDir is a local-only cache for Zulip /user_uploads/ attachments.
+		// Cached private media is never published by zulcrawl.
+		CacheDir string `toml:"cache_dir"`
+	} `toml:"media"`
 	Sync struct {
 		Concurrency    int      `toml:"concurrency"`
 		Streams        []string `toml:"streams"`
@@ -58,6 +63,7 @@ type Config struct {
 func Default() *Config {
 	c := &Config{}
 	c.Database.Path = "~/.zulcrawl/zulcrawl.db"
+	c.Media.CacheDir = "~/.zulcrawl/media"
 	c.Sync.Concurrency = 4
 	c.Sync.Streams = []string{}
 	c.Sync.ExcludeStreams = []string{"social", "random"}
@@ -118,6 +124,9 @@ func (c *Config) Normalize() {
 	if c.Database.Path == "" {
 		c.Database.Path = "~/.zulcrawl/zulcrawl.db"
 	}
+	if c.Media.CacheDir == "" {
+		c.Media.CacheDir = "~/.zulcrawl/media"
+	}
 }
 
 func (c *Config) ApplyEnv() {
@@ -149,6 +158,10 @@ func (c *Config) Save(path string) error {
 
 func (c *Config) DBPath() string {
 	return ExpandPath(c.Database.Path)
+}
+
+func (c *Config) MediaCacheDir() string {
+	return ExpandPath(c.Media.CacheDir)
 }
 
 func (c *Config) ValidateEmbeddings() error {
