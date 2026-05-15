@@ -243,3 +243,69 @@ func TestMessagesCommandRejectsNegativeCounts(t *testing.T) {
 		}
 	}
 }
+
+func runDigest(t *testing.T, cfgPath string, args ...string) (string, error) {
+	t.Helper()
+	root := cli.NewRootCmd()
+
+	var buf bytes.Buffer
+	root.SetOut(&buf)
+	root.SetErr(&buf)
+
+	fullArgs := append([]string{"--config", cfgPath, "digest"}, args...)
+	root.SetArgs(fullArgs)
+
+	err := root.ExecuteContext(context.Background())
+	return buf.String(), err
+}
+
+func TestDigestCmd_TextOutput(t *testing.T) {
+	cfgPath := setupCLITest(t)
+	since := time.Now().UTC().Add(-8 * 24 * time.Hour).Format("2006-01-02")
+	out, err := runDigest(t, cfgPath, "--stream", "general", "--since", since)
+	if err != nil {
+		t.Fatalf("unexpected error: %v\nOutput: %s", err, out)
+	}
+	for _, want := range []string{"#general > deploys", "3 messages", "participants: Alice", "latest: deployed v3", "(1 topics)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in output, got: %s", want, out)
+		}
+	}
+}
+
+func TestDigestCmd_JSONOutput(t *testing.T) {
+	cfgPath := setupCLITest(t)
+	since := time.Now().UTC().Add(-8 * 24 * time.Hour).Format(time.RFC3339)
+	out, err := runDigest(t, cfgPath, "--stream", "general", "--since", since, "--json")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out, `"topic": "deploys"`) || !strings.Contains(out, `"messages": 3`) {
+		t.Errorf("expected JSON digest row, got: %s", out)
+	}
+}
+
+func TestDigestCmd_RequiresStreamAndSince(t *testing.T) {
+	cfgPath := setupCLITest(t)
+	if _, err := runDigest(t, cfgPath, "--since", "2026-01-01"); err == nil {
+		t.Fatal("expected missing --stream error")
+	}
+	if _, err := runDigest(t, cfgPath, "--stream", "general"); err == nil {
+		t.Fatal("expected missing --since error")
+	}
+}
+
+func TestDigestCmd_UntilAndLimit(t *testing.T) {
+	cfgPath := setupCLITest(t)
+	out, err := runDigest(t, cfgPath,
+		"--stream", "general",
+		"--since", time.Now().UTC().Add(-8*24*time.Hour).Format("2006-01-02"),
+		"--until", time.Now().UTC().Add(-2*24*time.Hour).Format(time.RFC3339),
+		"--limit", "1")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(out, "2 messages") {
+		t.Errorf("expected until filter to leave 2 messages, got: %s", out)
+	}
+}
