@@ -1,7 +1,6 @@
 package zulip
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -153,16 +152,66 @@ func (c *Client) doRaw(ctx context.Context, method, path string, q url.Values) (
 }
 
 // Download fetches a Zulip-hosted upload using the same basic auth credentials
-// as API calls. Only local /user_uploads/ paths are accepted.
+// as API calls. Only local /user_uploads/ paths are accepted. The response body
+// is streamed to the caller; callers must close it.
 func (c *Client) Download(ctx context.Context, path string) (io.ReadCloser, string, error) {
-	if !strings.HasPrefix(path, "/user_uploads/") {
-		return nil, "", fmt.Errorf("not a Zulip upload path: %s", path)
-	}
-	body, hdr, err := c.doRaw(ctx, http.MethodGet, path, nil)
+	resp, err := c.downloadResponse(ctx, path)
 	if err != nil {
 		return nil, "", err
 	}
-	return io.NopCloser(bytes.NewReader(body)), hdr.Get("Content-Type"), nil
+	return resp.Body, resp.Header.Get("Content-Type"), nil
+}
+
+func (c *Client) downloadResponse(ctx context.Context, path string) (*http.Response, error) {
+	if !strings.HasPrefix(path, "/user_uploads/") {
+		return nil, fmt.Errorf("not a Zulip upload path: %s", path)
+	}
+	u := c.baseURL + path
+
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.SetBasicAuth(c.email, c.apiKey)
+
+		resp, err := c.hc.Do(req)
+		if err != nil {
+			lastErr = err
+			time.Sleep(time.Duration(attempt+1) * time.Second)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			_ = resp.Body.Close()
+			wait := 2 * time.Second
+			if ra := resp.Header.Get("Retry-After"); ra != "" {
+				if n, err := strconv.Atoi(ra); err == nil {
+					wait = time.Duration(n) * time.Second
+				}
+			}
+			time.Sleep(wait)
+			continue
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("zulip download %s: status %d: %s", path, resp.StatusCode, strings.TrimSpace(string(body)))
+		}
+
+		if rem := resp.Header.Get("X-RateLimit-Remaining"); rem != "" {
+			if n, err := strconv.Atoi(rem); err == nil && n < 5 {
+				time.Sleep(1500 * time.Millisecond)
+			}
+		}
+		return resp, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("zulip download %s failed after retries", path)
 }
 
 func (c *Client) ServerSettings(ctx context.Context) (*ServerSettings, error) {

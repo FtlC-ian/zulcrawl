@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -231,5 +232,49 @@ func TestAttachmentMediaMetadata(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].MediaPath != "/tmp/report.txt" || rows[0].MediaBytes != 12 {
 		t.Fatalf("fetched rows = %#v", rows)
+	}
+}
+
+func TestListAttachmentsLimitSemantics(t *testing.T) {
+	st, ctx := setupTestStore(t)
+	topicID, err := st.GetOrCreateTopic(ctx, 1, 10, "triage")
+	if err != nil {
+		t.Fatalf("GetOrCreateTopic: %v", err)
+	}
+	for i := int64(1); i <= 105; i++ {
+		msg := Message{
+			ID:            1000 + i,
+			OrgID:         1,
+			StreamID:      10,
+			TopicID:       topicID,
+			SenderID:      20,
+			Content:       "file",
+			ContentText:   "file",
+			Timestamp:     "2026-01-02T03:04:05Z",
+			HasAttachment: true,
+			Attachments: []Attachment{{
+				URL:      fmt.Sprintf("/user_uploads/a/file%03d.txt", i),
+				FileName: "file.txt",
+			}},
+		}
+		if err := st.UpsertMessage(ctx, msg); err != nil {
+			t.Fatalf("UpsertMessage %d: %v", i, err)
+		}
+	}
+
+	rows, err := st.ListAttachments(ctx, AttachmentFilter{Status: "pending"})
+	if err != nil {
+		t.Fatalf("ListAttachments unlimited: %v", err)
+	}
+	if len(rows) != 105 {
+		t.Fatalf("unlimited ListAttachments returned %d rows, want 105", len(rows))
+	}
+
+	rows, err = st.ListAttachments(ctx, AttachmentFilter{Status: "pending", Limit: 100})
+	if err != nil {
+		t.Fatalf("ListAttachments limited: %v", err)
+	}
+	if len(rows) != 100 {
+		t.Fatalf("limited ListAttachments returned %d rows, want 100", len(rows))
 	}
 }

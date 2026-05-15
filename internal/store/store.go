@@ -1340,9 +1340,6 @@ type AttachmentFilter struct {
 
 func (s *Store) ListAttachments(ctx context.Context, f AttachmentFilter) ([]AttachmentRow, error) {
 	limit := f.Limit
-	if limit <= 0 {
-		limit = 100
-	}
 	q := `
 SELECT a.id, a.message_id, st.name, t.name, COALESCE(u.full_name,''), a.url,
        COALESCE(a.file_name,''), COALESCE(a.title,''), COALESCE(a.content_type,''), a.timestamp,
