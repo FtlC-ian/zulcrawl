@@ -624,13 +624,28 @@ The default safety limit is 200 messages; use --limit or --all to override.`,
 	return cmd
 }
 
+type digestJSONOutput struct {
+	Stream                string                  `json:"stream"`
+	Topics                []digestJSONRow         `json:"topics"`
+	MentionHeavyTopics    []digestJSONTopicSignal `json:"mention_heavy_topics"`
+	AttachmentHeavyTopics []digestJSONTopicSignal `json:"attachment_heavy_topics"`
+}
+
 type digestJSONRow struct {
+	Stream       string   `json:"stream"`
 	Topic        string   `json:"topic"`
 	Messages     int      `json:"messages"`
 	FirstAt      string   `json:"first_at"`
 	LastAt       string   `json:"last_at"`
 	Participants []string `json:"participants"`
 	Preview      string   `json:"preview"`
+}
+
+type digestJSONTopicSignal struct {
+	Stream string `json:"stream"`
+	Topic  string `json:"topic"`
+	Count  int    `json:"count"`
+	LastAt string `json:"last_at"`
 }
 
 func digestCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
@@ -679,19 +694,34 @@ and a latest-message preview. Use --stream and --since to keep the slice bounded
 			}
 			defer st.Close()
 
-			rows, err := st.Digest(cmd.Context(), store.DigestFilter{
+			filter := store.DigestFilter{
 				Stream: stream,
 				Since:  normSince,
 				Until:  normUntil,
 				Limit:  limit,
-			})
+			}
+			rows, err := st.Digest(cmd.Context(), filter)
+			if err != nil {
+				return err
+			}
+			mentionHeavy, err := st.DigestMentionHeavyTopics(cmd.Context(), filter)
+			if err != nil {
+				return err
+			}
+			attachmentHeavy, err := st.DigestAttachmentHeavyTopics(cmd.Context(), filter)
 			if err != nil {
 				return err
 			}
 			if jsonOut {
-				out := make([]digestJSONRow, 0, len(rows))
+				out := digestJSONOutput{
+					Stream:                stream,
+					Topics:                make([]digestJSONRow, 0, len(rows)),
+					MentionHeavyTopics:    digestJSONSignals(mentionHeavy),
+					AttachmentHeavyTopics: digestJSONSignals(attachmentHeavy),
+				}
 				for _, r := range rows {
-					out = append(out, digestJSONRow{
+					out.Topics = append(out.Topics, digestJSONRow{
+						Stream:       r.StreamName,
 						Topic:        r.TopicName,
 						Messages:     r.MessageCount,
 						FirstAt:      r.FirstMessageAt,
@@ -719,6 +749,8 @@ and a latest-message preview. Use --stream and --since to keep the slice bounded
 				}
 				fmt.Fprintln(cmd.OutOrStdout())
 			}
+			printDigestSignals(cmd, "Mention-heavy topics", mentionHeavy, "mentions")
+			printDigestSignals(cmd, "Attachment-heavy topics", attachmentHeavy, "attachments")
 			fmt.Fprintf(cmd.OutOrStdout(), "(%d topics)\n", len(rows))
 			return nil
 		},
@@ -729,6 +761,31 @@ and a latest-message preview. Use --stream and --since to keep the slice bounded
 	cmd.Flags().IntVar(&limit, "limit", 20, "maximum topics to return")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON instead of text")
 	return cmd
+}
+
+func digestJSONSignals(rows []store.DigestTopicSignal) []digestJSONTopicSignal {
+	out := make([]digestJSONTopicSignal, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, digestJSONTopicSignal{
+			Stream: r.StreamName,
+			Topic:  r.TopicName,
+			Count:  r.Count,
+			LastAt: r.LastAt,
+		})
+	}
+	return out
+}
+
+func printDigestSignals(cmd *cobra.Command, title string, rows []store.DigestTopicSignal, unit string) {
+	if len(rows) == 0 {
+		return
+	}
+	fmt.Fprintf(cmd.OutOrStdout(), "%s:\n", title)
+	for _, r := range rows {
+		fmt.Fprintf(cmd.OutOrStdout(), "  #%s > %s (%d %s, last %s)\n",
+			r.StreamName, r.TopicName, r.Count, unit, formatDigestTime(r.LastAt))
+	}
+	fmt.Fprintln(cmd.OutOrStdout())
 }
 
 func normalizeCLITime(flagName, val string, endOfDay bool) (string, error) {

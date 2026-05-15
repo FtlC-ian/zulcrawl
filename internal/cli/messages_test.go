@@ -54,7 +54,7 @@ func setupCLITest(t *testing.T) string {
 	}
 	now := time.Now().UTC()
 	for i, content := range []string{"deployed v1", "deployed v2", "deployed v3"} {
-		if err := st.UpsertMessage(ctx, store.Message{
+		msg := store.Message{
 			ID:          int64(100 + i),
 			OrgID:       1,
 			StreamID:    1,
@@ -63,7 +63,18 @@ func setupCLITest(t *testing.T) string {
 			Content:     content,
 			ContentText: content,
 			Timestamp:   now.Add(time.Duration(-3+i) * 24 * time.Hour).Format(time.RFC3339),
-		}); err != nil {
+		}
+		if i < 2 {
+			msg.Mentions = []store.Mention{{UserID: 10, Name: "Alice", Kind: "user"}}
+		}
+		if i == 2 {
+			msg.HasAttachment = true
+			msg.Attachments = []store.Attachment{
+				{URL: "/user_uploads/1/deploy-log.txt", FileName: "deploy-log.txt", Text: "deploy log", Indexed: true},
+				{URL: "/user_uploads/1/screenshot.png", FileName: "screenshot.png"},
+			}
+		}
+		if err := st.UpsertMessage(ctx, msg); err != nil {
 			t.Fatalf("UpsertMessage: %v", err)
 		}
 	}
@@ -266,7 +277,7 @@ func TestDigestCmd_TextOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v\nOutput: %s", err, out)
 	}
-	for _, want := range []string{"#general > deploys", "3 messages", "participants: Alice", "latest: deployed v3", "(1 topics)"} {
+	for _, want := range []string{"#general > deploys", "3 messages", "participants: Alice", "latest: deployed v3", "Mention-heavy topics:", "2 mentions", "Attachment-heavy topics:", "2 attachments", "(1 topics)"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("expected %q in output, got: %s", want, out)
 		}
@@ -280,8 +291,10 @@ func TestDigestCmd_JSONOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(out, `"topic": "deploys"`) || !strings.Contains(out, `"messages": 3`) {
-		t.Errorf("expected JSON digest row, got: %s", out)
+	for _, want := range []string{`"stream": "general"`, `"topics": [`, `"topic": "deploys"`, `"messages": 3`, `"mention_heavy_topics": [`, `"count": 2`, `"attachment_heavy_topics": [`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %s in JSON digest, got: %s", want, out)
+		}
 	}
 }
 

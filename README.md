@@ -178,7 +178,8 @@ Vector-embedding provider integration is deferred to a future chunk (issue #9).
 `zulcrawl digest` summarizes a bounded slice of the local SQLite archive without
 hitting the Zulip API or any remote summarization service. It groups matching
 messages by topic and reports counts, first/last timestamps, participants, and
-a latest-message preview.
+a latest-message preview. It also highlights mention-heavy and attachment-heavy
+topics using the local `message_mentions` and `message_attachments` indexes.
 
 `--stream` and `--since` are required so digest runs stay intentionally scoped.
 
@@ -206,7 +207,17 @@ Text output format:
 #stream > topic (N messages, YYYY-MM-DD HH:MM to YYYY-MM-DD HH:MM)
   participants: Alice, Bob
   latest: latest message preview
+
+Mention-heavy topics:
+  #stream > topic (N mentions, last YYYY-MM-DD HH:MM)
+
+Attachment-heavy topics:
+  #stream > topic (N attachments, last YYYY-MM-DD HH:MM)
 ```
+
+JSON output is self-contained: the top-level object includes `stream`, `topics`,
+`mention_heavy_topics`, and `attachment_heavy_topics`; each topic row also
+includes its `stream`.
 
 ## messages command
 

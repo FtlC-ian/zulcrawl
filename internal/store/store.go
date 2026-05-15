@@ -1172,6 +1172,15 @@ type DigestRow struct {
 	Preview        string
 }
 
+// DigestTopicSignal summarizes a topic that stands out for one indexed signal
+// in a local-only digest (for example mentions or attachments).
+type DigestTopicSignal struct {
+	StreamName string
+	TopicName  string
+	Count      int
+	LastAt     string
+}
+
 // Digest groups messages by topic for a stream/time slice. It only reads the
 // local SQLite mirror; no Zulip API calls or remote services are involved.
 func (s *Store) Digest(ctx context.Context, f DigestFilter) ([]DigestRow, error) {
@@ -1251,6 +1260,66 @@ LIMIT ?`
 		}
 		if participants != "" {
 			r.Participants = strings.Split(participants, string(rune(31)))
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// DigestMentionHeavyTopics returns topics in the digest slice with the most
+// indexed mentions. It only reads message_mentions from the local SQLite mirror.
+func (s *Store) DigestMentionHeavyTopics(ctx context.Context, f DigestFilter) ([]DigestTopicSignal, error) {
+	return s.digestTopicSignals(ctx, f, "message_mentions", "mention-heavy topics")
+}
+
+// DigestAttachmentHeavyTopics returns topics in the digest slice with the most
+// indexed attachments. It only reads message_attachments from the local SQLite mirror.
+func (s *Store) DigestAttachmentHeavyTopics(ctx context.Context, f DigestFilter) ([]DigestTopicSignal, error) {
+	return s.digestTopicSignals(ctx, f, "message_attachments", "attachment-heavy topics")
+}
+
+func (s *Store) digestTopicSignals(ctx context.Context, f DigestFilter, table, label string) ([]DigestTopicSignal, error) {
+	if f.Stream == "" {
+		return nil, fmt.Errorf("stream is required")
+	}
+	if f.Since == "" {
+		return nil, fmt.Errorf("since is required")
+	}
+	if f.Limit <= 0 {
+		f.Limit = 20
+	}
+	if table != "message_mentions" && table != "message_attachments" {
+		return nil, fmt.Errorf("unsupported digest signal table %q", table)
+	}
+
+	q := fmt.Sprintf(`
+SELECT st.name, t.name, COUNT(*) AS signal_count, MAX(x.timestamp) AS last_at
+FROM %s x
+JOIN streams st ON st.id = x.stream_id
+JOIN topics t ON t.id = x.topic_id
+WHERE st.name = ?
+  AND x.timestamp >= ?`, table)
+	args := []any{f.Stream, f.Since}
+	if f.Until != "" {
+		q += " AND x.timestamp <= ?"
+		args = append(args, f.Until)
+	}
+	q += `
+GROUP BY st.name, t.id, t.name
+ORDER BY signal_count DESC, last_at DESC, t.name ASC
+LIMIT ?`
+	args = append(args, f.Limit)
+
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("digest %s: %w", label, err)
+	}
+	defer rows.Close()
+	var out []DigestTopicSignal
+	for rows.Next() {
+		var r DigestTopicSignal
+		if err := rows.Scan(&r.StreamName, &r.TopicName, &r.Count, &r.LastAt); err != nil {
+			return nil, err
 		}
 		out = append(out, r)
 	}
