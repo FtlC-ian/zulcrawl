@@ -17,6 +17,7 @@
   - `stats`
   - `sql`
   - `messages` — direct archive slice queries (see below)
+  - `digest` — local-only topic activity digest (see below)
   - `attachments` / `attachments fetch` — list indexed uploads and cache Zulip media locally
   - `backfill-indexes` — rebuild mention/attachment indexes for existing messages
   - `embeddings backfill` — build/update Ollama topic embeddings (disabled by default)
@@ -125,6 +126,10 @@ zulcrawl topics search "database migration"
 zulcrawl topics search --stream engineering "deploy script"
 zulcrawl topics search --unresolved --limit 10 "onboarding"
 
+# Local topic digest
+zulcrawl digest --stream engineering --since 2026-05-01
+zulcrawl digest --stream engineering --since 2026-05-01 --until 2026-05-15 --json
+
 # Stats
 zulcrawl stats
 
@@ -167,6 +172,52 @@ Vector-embedding provider integration is deferred to a future chunk (issue #9).
 #stream > topic name [resolved] (N msgs, last YYYY-MM-DD)
   …best matching message snippet…
 ```
+
+## digest command
+
+`zulcrawl digest` summarizes a bounded slice of the local SQLite archive without
+hitting the Zulip API or any remote summarization service. It groups matching
+messages by topic and reports counts, first/last timestamps, participants, and
+a latest-message preview. It also highlights mention-heavy and attachment-heavy
+topics using the local `message_mentions` and `message_attachments` indexes.
+
+`--stream` and `--since` are required so digest runs stay intentionally scoped.
+
+**Flags**
+
+| Flag | Description |
+|------|-------------|
+| `--stream NAME` | Stream name to summarize (required) |
+| `--since DATE` | Include messages at or after this time (RFC3339 or `YYYY-MM-DD`; required) |
+| `--until DATE` | Include messages at or before this time (RFC3339 or `YYYY-MM-DD`) |
+| `--limit N` | Maximum topics to return (default 20) |
+| `--json` | Emit machine-readable JSON instead of text |
+
+**Examples**
+
+```bash
+zulcrawl digest --stream engineering --since 2026-05-01
+zulcrawl digest --stream support --since 2026-05-01T00:00:00Z --until 2026-05-15T23:59:59Z --limit 10
+zulcrawl digest --stream engineering --since 2026-05-01 --json
+```
+
+Text output format:
+
+```
+#stream > topic (N messages, YYYY-MM-DD HH:MM to YYYY-MM-DD HH:MM)
+  participants: Alice, Bob
+  latest: latest message preview
+
+Mention-heavy topics:
+  #stream > topic (N mentions, last YYYY-MM-DD HH:MM)
+
+Attachment-heavy topics:
+  #stream > topic (N attachments, last YYYY-MM-DD HH:MM)
+```
+
+JSON output is self-contained: the top-level object includes `stream`, `topics`,
+`mention_heavy_topics`, and `attachment_heavy_topics`; each topic row also
+includes its `stream`.
 
 ## messages command
 
