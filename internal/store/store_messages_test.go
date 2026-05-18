@@ -377,3 +377,67 @@ func TestMessageRowsForBackfillBoundsToMaxID(t *testing.T) {
 		t.Fatal("expected bounded backfill rows")
 	}
 }
+
+func TestDigestIgnoresRowsWithMismatchedOrgRelations(t *testing.T) {
+	st := openTestStore(t)
+	defer st.Close()
+	streams := seedDB(t, st)
+	ctx := context.Background()
+
+	if err := st.UpsertOrganization(ctx, 2, "https://other.example.com", "OtherOrg"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertStream(ctx, store.Stream{ID: 99, OrgID: 2, Name: "general"}); err != nil {
+		t.Fatal(err)
+	}
+	topicID, err := st.GetOrCreateTopic(ctx, 1, streams["general"], "deploys")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Foreign keys prove the referenced IDs exist, but they do not prove those IDs
+	// belong to the same org/stream graph. Digest queries must enforce that graph.
+	ts := time.Now().UTC().Format(time.RFC3339)
+	if err := st.UpsertMessage(ctx, store.Message{
+		ID:            9001,
+		OrgID:         1,
+		StreamID:      99,
+		TopicID:       topicID,
+		SenderID:      10,
+		Content:       "cross-org mismatch",
+		ContentText:   "cross-org mismatch",
+		Timestamp:     ts,
+		HasAttachment: true,
+		Mentions:      []store.Mention{{UserID: 10, Name: "Alice", Kind: "user"}},
+		Attachments:   []store.Attachment{{URL: "/user_uploads/1/mismatch.txt", FileName: "mismatch.txt", Indexed: true}},
+	}); err != nil {
+		t.Fatalf("UpsertMessage mismatch: %v", err)
+	}
+
+	filter := store.DigestFilter{Stream: "general", Since: time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339), Limit: 20}
+	rows, err := st.Digest(ctx, filter)
+	if err != nil {
+		t.Fatalf("Digest: %v", err)
+	}
+	for _, row := range rows {
+		if row.Preview == "cross-org mismatch" {
+			t.Fatalf("digest included mismatched row: %#v", row)
+		}
+	}
+
+	mentions, err := st.DigestMentionHeavyTopics(ctx, filter)
+	if err != nil {
+		t.Fatalf("DigestMentionHeavyTopics: %v", err)
+	}
+	if len(mentions) != 0 {
+		t.Fatalf("mention digest included mismatched signal rows: %#v", mentions)
+	}
+
+	attachments, err := st.DigestAttachmentHeavyTopics(ctx, filter)
+	if err != nil {
+		t.Fatalf("DigestAttachmentHeavyTopics: %v", err)
+	}
+	if len(attachments) != 0 {
+		t.Fatalf("attachment digest included mismatched signal rows: %#v", attachments)
+	}
+}

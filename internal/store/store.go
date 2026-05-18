@@ -1203,8 +1203,10 @@ SELECT st.name, t.name, COUNT(*) AS message_count,
          FROM (
            SELECT DISTINCT COALESCE(u2.full_name,'') AS name
            FROM messages m2
-           JOIN users u2 ON u2.id = m2.sender_id
+           JOIN users u2 ON u2.id = m2.sender_id AND u2.org_id = m2.org_id
            WHERE m2.topic_id = t.id
+             AND m2.org_id = t.org_id
+             AND m2.stream_id = t.stream_id
              AND m2.timestamp >= ?`
 	args := []any{f.Since}
 	if f.Until != "" {
@@ -1220,6 +1222,8 @@ SELECT st.name, t.name, COUNT(*) AS message_count,
          SELECT m3.content_text
          FROM messages m3
          WHERE m3.topic_id = t.id
+           AND m3.org_id = t.org_id
+           AND m3.stream_id = t.stream_id
            AND m3.timestamp >= ?`
 	args = append(args, f.Since)
 	if f.Until != "" {
@@ -1231,8 +1235,8 @@ SELECT st.name, t.name, COUNT(*) AS message_count,
          LIMIT 1
        ), '') AS preview
 FROM messages m
-JOIN streams st ON st.id = m.stream_id
-JOIN topics t ON t.id = m.topic_id
+JOIN streams st ON st.id = m.stream_id AND st.org_id = m.org_id
+JOIN topics t ON t.id = m.topic_id AND t.org_id = m.org_id AND t.stream_id = m.stream_id
 WHERE st.name = ?
   AND m.timestamp >= ?`
 	args = append(args, f.Stream, f.Since)
@@ -1295,8 +1299,8 @@ func (s *Store) digestTopicSignals(ctx context.Context, f DigestFilter, table, l
 	q := fmt.Sprintf(`
 SELECT st.name, t.name, COUNT(*) AS signal_count, MAX(x.timestamp) AS last_at
 FROM %s x
-JOIN streams st ON st.id = x.stream_id
-JOIN topics t ON t.id = x.topic_id
+JOIN streams st ON st.id = x.stream_id AND st.org_id = x.org_id
+JOIN topics t ON t.id = x.topic_id AND t.org_id = x.org_id AND t.stream_id = x.stream_id
 WHERE st.name = ?
   AND x.timestamp >= ?`, table)
 	args := []any{f.Stream, f.Since}
