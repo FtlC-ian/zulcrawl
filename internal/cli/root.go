@@ -36,6 +36,7 @@ func NewRootCmd() *cobra.Command {
 
 	root.AddCommand(initCmd(&cfgPath, loadCfg))
 	root.AddCommand(doctorCmd(loadCfg))
+	root.AddCommand(statusCmd(loadCfg))
 	root.AddCommand(syncCmd(loadCfg))
 	root.AddCommand(searchCmd(loadCfg))
 	root.AddCommand(topicsCmd(loadCfg))
@@ -111,7 +112,8 @@ func initCmd(cfgPath *string, loadCfg func() (*config.Config, error)) *cobra.Com
 }
 
 func doctorCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
-	return &cobra.Command{
+	var asJSON bool
+	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Validate config, auth, and DB",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -130,6 +132,11 @@ func doctorCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 				return fmt.Errorf("zulip auth/api check failed: %w", err)
 			}
 
+			l, err := lock.Acquire(cfg.DBPath() + ".lock")
+			if err != nil {
+				return err
+			}
+			defer l.Release()
 			st, err := store.Open(cfg.DBPath())
 			if err != nil {
 				return err
@@ -141,13 +148,26 @@ func doctorCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 			if err := st.Ping(ctx); err != nil {
 				return err
 			}
-			fmt.Println("doctor: OK")
+			report, err := healthReport(ctx, st, cfg)
+			if err != nil {
+				return err
+			}
+			if asJSON {
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(struct {
+					OK             bool `json:"ok"`
+					StreamsVisible int  `json:"streams_visible"`
+					store.HealthReport
+				}{true, len(streams), report})
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), "doctor: API and DB OK (see stream freshness below)")
 			fmt.Printf("  URL: %s\n", cfg.Zulip.URL)
 			fmt.Printf("  Streams visible: %d\n", len(streams))
 			fmt.Printf("  DB: %s\n", cfg.DBPath())
-			return nil
+			return printHealth(cmd, report, false)
 		},
 	}
+	cmd.Flags().BoolVar(&asJSON, "json", false, "emit machine-readable API and sync health")
+	return cmd
 }
 
 func syncCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
@@ -258,6 +278,9 @@ func searchCmd(loadCfg func() (*config.Config, error)) *cobra.Command {
 				return err
 			}
 			fmt.Println(search.FormatHits(hits))
+			if len(hits) == 0 {
+				return explainEmpty(cmd, cfg, st, stream)
+			}
 			return nil
 		},
 	}

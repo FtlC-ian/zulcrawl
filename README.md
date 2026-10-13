@@ -347,3 +347,11 @@ zulcrawl topics search --semantic --stream engineering "API rate limit"
 
 FTS-only behaviour is **unchanged** when `--semantic` is not set.
 
+# Sync reliability
+
+`zulcrawl status --json` and `zulcrawl doctor --json` expose per-stream freshness,
+history audit progress and a bounded failure ledger. Routine sync automatically
+reconciles missing history in resumable, bounded batches. Empty search results
+include stderr diagnostics. See [sync reliability](docs/sync-reliability.md) for
+policy, limitations, migration safety and deployment steps.
+

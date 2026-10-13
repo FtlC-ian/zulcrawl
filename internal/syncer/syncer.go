@@ -49,9 +49,11 @@ const (
 )
 
 type Options struct {
-	Full    bool
-	Streams []string
-	Since   string
+	repair       bool
+	repairAnchor string
+	Full         bool
+	Streams      []string
+	Since        string
 }
 
 func New(cfg *config.Config, api *zulip.Client, st *store.Store) *Syncer {
@@ -101,7 +103,12 @@ func (s *Syncer) Sync(ctx context.Context, opts Options) error {
 	}
 
 	s.logger.log("syncing private/direct messages")
-	if err := s.syncPrivateMessages(ctx, opts); err != nil {
+	if err := s.trackedSync(ctx, privateStreamID, func() error {
+		if err := s.repair(ctx, privateStreamID, func(o Options) error { return s.syncPrivateMessages(ctx, o) }, opts); err != nil {
+			return err
+		}
+		return s.syncPrivateMessages(ctx, opts)
+	}); err != nil {
 		return fmt.Errorf("private messages: %w", err)
 	}
 
@@ -122,7 +129,12 @@ func (s *Syncer) syncStreams(ctx context.Context, selected []zulip.Stream, opts 
 		go func() {
 			defer wg.Done()
 			for st := range ch {
-				if err := s.syncStream(ctx, st, opts); err != nil {
+				if err := s.trackedSync(ctx, st.StreamID, func() error {
+					if err := s.repair(ctx, st.StreamID, func(o Options) error { return s.syncStream(ctx, st, o) }, opts); err != nil {
+						return err
+					}
+					return s.syncStream(ctx, st, opts)
+				}); err != nil {
 					errCh <- fmt.Errorf("stream %s: %w", st.Name, err)
 				}
 			}
@@ -168,10 +180,18 @@ func (s *Syncer) syncStreams(ctx context.Context, selected []zulip.Stream, opts 
 func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) error {
 	anchor := "oldest"
 	if !opts.Full {
-		if last, err := s.store.LastMessageID(ctx, s.orgID, st.StreamID); err == nil && last > 0 {
+		last, err := s.store.LastMessageID(ctx, s.orgID, st.StreamID)
+		if err != nil {
+			return err
+		}
+		if last > 0 {
 			anchor = fmt.Sprintf("%d", last)
 		}
 	}
+	if opts.repair {
+		anchor = opts.repairAnchor
+	}
+	beganAtOldest := anchor == "oldest"
 	mode := "incremental"
 	if opts.Full || anchor == "oldest" {
 		mode = "full"
@@ -198,8 +218,30 @@ func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) 
 		if err != nil {
 			return err
 		}
+		next, err := nextAnchor(anchor, resp.Messages, resp.FoundNewest)
+		if err != nil {
+			return err
+		}
 		if len(resp.Messages) == 0 {
+			if opts.repair {
+				if err := s.store.SaveRepair(ctx, s.orgID, st.StreamID, anchor, true); err != nil {
+					return err
+				}
+			}
 			break
+		}
+		if opts.repair {
+			existing, err := s.store.ExistingMessageIDs(ctx, resp.Messages[0].ID, resp.Messages[len(resp.Messages)-1].ID)
+			if err != nil {
+				return err
+			}
+			missing := make([]zulip.Message, 0, len(resp.Messages))
+			for _, m := range resp.Messages {
+				if !existing[m.ID] {
+					missing = append(missing, m)
+				}
+			}
+			resp.Messages = missing
 		}
 		s.logger.log("stream %q: page %d – %d messages (anchor=%s)", st.Name, pageNum, len(resp.Messages), anchor)
 
@@ -280,8 +322,21 @@ func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) 
 		// Advance anchor past the last seen ID to avoid re-fetching it on the
 		// next page.  Zulip includes the anchor message in the result set, so
 		// using last_id+1 prevents a redundant duplicate on every page turn.
-		lastID := resp.Messages[len(resp.Messages)-1].ID
-		anchor = fmt.Sprintf("%d", lastID+1)
+		anchor = next
+		if opts.repair {
+			for tid := range touched {
+				if err := s.store.RecomputeTopicStats(ctx, tid); err != nil {
+					return err
+				}
+			}
+			clear(touched)
+			if err := s.store.SaveRepair(ctx, s.orgID, st.StreamID, anchor, resp.FoundNewest); err != nil {
+				return err
+			}
+			if pageNum >= repairPageBudget {
+				break
+			}
+		}
 		if resp.FoundNewest {
 			break
 		}
@@ -292,8 +347,13 @@ func (s *Syncer) syncStream(ctx context.Context, st zulip.Stream, opts Options) 
 			return err
 		}
 	}
-	if maxID > 0 {
+	if maxID > 0 && !opts.repair {
 		if err := s.store.UpdateSyncState(ctx, s.orgID, st.StreamID, maxID); err != nil {
+			return err
+		}
+	}
+	if !opts.repair && beganAtOldest && opts.Since == "" {
+		if err := s.store.SaveRepair(ctx, s.orgID, st.StreamID, "oldest", true); err != nil {
 			return err
 		}
 	}
@@ -315,10 +375,18 @@ func (s *Syncer) syncPrivateMessages(ctx context.Context, opts Options) error {
 
 	anchor := "oldest"
 	if !opts.Full {
-		if last, err := s.store.LastMessageID(ctx, s.orgID, privateStreamID); err == nil && last > 0 {
+		last, err := s.store.LastMessageID(ctx, s.orgID, privateStreamID)
+		if err != nil {
+			return err
+		}
+		if last > 0 {
 			anchor = fmt.Sprintf("%d", last)
 		}
 	}
+	if opts.repair {
+		anchor = opts.repairAnchor
+	}
+	beganAtOldest := anchor == "oldest"
 	mode := "incremental"
 	if opts.Full || anchor == "oldest" {
 		mode = "full"
@@ -343,8 +411,30 @@ func (s *Syncer) syncPrivateMessages(ctx context.Context, opts Options) error {
 		if err != nil {
 			return err
 		}
+		next, err := nextAnchor(anchor, resp.Messages, resp.FoundNewest)
+		if err != nil {
+			return err
+		}
 		if len(resp.Messages) == 0 {
+			if opts.repair {
+				if err := s.store.SaveRepair(ctx, s.orgID, privateStreamID, anchor, true); err != nil {
+					return err
+				}
+			}
 			break
+		}
+		if opts.repair {
+			existing, err := s.store.ExistingMessageIDs(ctx, resp.Messages[0].ID, resp.Messages[len(resp.Messages)-1].ID)
+			if err != nil {
+				return err
+			}
+			missing := make([]zulip.Message, 0, len(resp.Messages))
+			for _, m := range resp.Messages {
+				if !existing[m.ID] {
+					missing = append(missing, m)
+				}
+			}
+			resp.Messages = missing
 		}
 		s.logger.log("private messages: page %d – %d messages (anchor=%s)", pageNum, len(resp.Messages), anchor)
 
@@ -409,8 +499,21 @@ func (s *Syncer) syncPrivateMessages(ctx context.Context, opts Options) error {
 			return fmt.Errorf("batch upsert (%d msgs): %w", len(batch), err)
 		}
 
-		lastID := resp.Messages[len(resp.Messages)-1].ID
-		anchor = fmt.Sprintf("%d", lastID+1)
+		anchor = next
+		if opts.repair {
+			for tid := range touched {
+				if err := s.store.RecomputeTopicStats(ctx, tid); err != nil {
+					return err
+				}
+			}
+			clear(touched)
+			if err := s.store.SaveRepair(ctx, s.orgID, privateStreamID, anchor, resp.FoundNewest); err != nil {
+				return err
+			}
+			if pageNum >= repairPageBudget {
+				break
+			}
+		}
 		if resp.FoundNewest {
 			break
 		}
@@ -421,8 +524,13 @@ func (s *Syncer) syncPrivateMessages(ctx context.Context, opts Options) error {
 			return err
 		}
 	}
-	if maxID > 0 {
+	if maxID > 0 && !opts.repair {
 		if err := s.store.UpdateSyncState(ctx, s.orgID, privateStreamID, maxID); err != nil {
+			return err
+		}
+	}
+	if !opts.repair && beganAtOldest && opts.Since == "" {
+		if err := s.store.SaveRepair(ctx, s.orgID, privateStreamID, "oldest", true); err != nil {
 			return err
 		}
 	}

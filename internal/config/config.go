@@ -95,6 +95,7 @@ func ExpandPath(path string) string {
 }
 
 func Load(path string) (*Config, error) {
+	explicit := path != ""
 	if path == "" {
 		path = DefaultPath()
 	}
@@ -103,7 +104,7 @@ func Load(path string) (*Config, error) {
 	cfg := Default()
 	b, err := os.ReadFile(path)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, os.ErrNotExist) && !explicit {
 			cfg.ApplyEnv()
 			return cfg, nil
 		}
