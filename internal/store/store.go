@@ -214,6 +214,9 @@ END;
 			return err
 		}
 	}
+    if err := s.initReliabilitySchema(ctx); err != nil {
+		return err
+	}
 	return s.InitEmbeddingSchema(ctx)
 }
 
@@ -596,7 +599,7 @@ func (s *Store) UpdateSyncState(ctx context.Context, orgID, streamID, lastMessag
 INSERT INTO sync_state(org_id, stream_id, last_message_id, synced_at)
 VALUES (?, ?, ?, ?)
 ON CONFLICT(org_id, stream_id) DO UPDATE SET
-last_message_id=excluded.last_message_id,
+last_message_id=MAX(COALESCE(sync_state.last_message_id,0),excluded.last_message_id),
 synced_at=excluded.synced_at
 `, orgID, streamID, lastMessageID, now())
 	return err
