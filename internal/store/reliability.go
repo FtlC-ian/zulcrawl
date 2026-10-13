@@ -144,7 +144,14 @@ type HealthReport struct {
 }
 
 func (s *Store) Health(ctx context.Context) (HealthReport, error) {
+	return s.HealthWithMaxAge(ctx, 2*time.Hour)
+}
+
+func (s *Store) HealthWithMaxAge(ctx context.Context, maxAge time.Duration) (HealthReport, error) {
 	report := HealthReport{SchemaVersion: 1, Streams: []StreamHealth{}, Failures: []SyncFailure{}}
+	if maxAge <= 0 {
+		return report, fmt.Errorf("sync freshness threshold must be positive")
+	}
 	var migrated bool
 	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_health')`).Scan(&migrated); err != nil {
 		return report, err
@@ -170,10 +177,9 @@ func (s *Store) Health(ctx context.Context) (HealthReport, error) {
 			return report, err
 		}
 		success, e := time.Parse(time.RFC3339, h.LastSuccess)
-		h.Stale = e != nil || time.Since(success) > 2*time.Hour || h.LastError != "" || h.CheckpointMissing
+		h.Stale = e != nil || time.Since(success) > maxAge || h.LastError != "" || h.CheckpointMissing
 		newest, e := time.Parse(time.RFC3339, h.NewestMessageAt)
 		h.Quiet = e != nil || success.Sub(newest) > 24*time.Hour
-		h.Stale = h.Stale || h.Quiet
 		report.Streams = append(report.Streams, h)
 	}
 	err = rows.Err()
