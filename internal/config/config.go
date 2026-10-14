@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	toml "github.com/pelletier/go-toml/v2"
 )
@@ -25,6 +26,7 @@ type Config struct {
 		CacheDir string `toml:"cache_dir"`
 	} `toml:"media"`
 	Sync struct {
+		StaleAfter     string   `toml:"stale_after"`
 		Concurrency    int      `toml:"concurrency"`
 		Streams        []string `toml:"streams"`
 		ExcludeStreams []string `toml:"exclude_streams"`
@@ -65,6 +67,7 @@ func Default() *Config {
 	c.Database.Path = "~/.zulcrawl/zulcrawl.db"
 	c.Media.CacheDir = "~/.zulcrawl/media"
 	c.Sync.Concurrency = 4
+	c.Sync.StaleAfter = "2h"
 	c.Sync.Streams = []string{}
 	c.Sync.ExcludeStreams = []string{"social", "random"}
 	c.Tail.RepairInterval = "30m"
@@ -159,6 +162,18 @@ func (c *Config) Save(path string) error {
 
 func (c *Config) DBPath() string {
 	return ExpandPath(c.Database.Path)
+}
+
+func (c *Config) SyncStaleAfter() (time.Duration, error) {
+	value := c.Sync.StaleAfter
+	if value == "" {
+		value = "2h"
+	}
+	d, err := time.ParseDuration(value)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("sync.stale_after must be a positive duration (for example 2h)")
+	}
+	return d, nil
 }
 
 func (c *Config) MediaCacheDir() string {

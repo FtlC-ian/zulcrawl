@@ -33,7 +33,11 @@ func excludedStream(cfg *config.Config, name string) bool {
 }
 
 func healthReport(ctx context.Context, st *store.Store, cfg *config.Config) (store.HealthReport, error) {
-	report, err := st.Health(ctx)
+	maxAge, err := cfg.SyncStaleAfter()
+	if err != nil {
+		return store.HealthReport{}, err
+	}
+	report, err := st.HealthWithMaxAge(ctx, maxAge)
 	for i := range report.Streams {
 		report.Streams[i].Excluded = excludedStream(cfg, report.Streams[i].Name)
 	}
@@ -46,6 +50,9 @@ func printHealth(cmd *cobra.Command, report store.HealthReport, asJSON bool) err
 	}
 	for _, h := range report.Streams {
 		state := "fresh"
+		if h.Quiet {
+			state = "fresh (quiet)"
+		}
 		if h.Stale {
 			state = "stale"
 		}
